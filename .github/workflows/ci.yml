@@ -64,3 +64,12 @@ jobs:
           for t in darwin/arm64 darwin/amd64 linux/amd64 linux/arm64 windows/amd64; do
             GOOS=${t%/*} GOARCH=${t#*/} CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /dev/null . || exit 1
           done
+
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: the server image builds and starts
+        run: |
+          docker build -t signet:ci .
+          docker run --rm signet:ci version

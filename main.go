@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"math/rand/v2"
 	"net"
 	"net/http"
@@ -91,6 +92,8 @@ func run(args []string) error {
 		return openEditor(args, dir)
 	case "serve":
 		return serve(dir, os.Stderr)
+	case "health":
+		return health()
 	case "set-default":
 		return setDefault()
 	case "inspect":
@@ -406,18 +409,42 @@ func startInBackground(dir string, secret []byte) (string, error) {
 }
 
 // serve runs the editor until nothing has talked to it for SIGNET_IDLE minutes
-// (default 10). The editor page pings it every minute while it is open.
+// (default 10; 0 = never, for servers). The editor page pings it every minute
+// while it is open. SIGNET_LISTEN sets the address (on a server); SIGNET_LOG=json
+// writes one JSON object per line.
 func serve(dir string, logw *os.File) error {
 	log.SetOutput(logw)
-	ln, err := net.Listen("tcp", "127.0.0.1:"+preferredPort())
-	if err != nil { // taken (another program, or another account's Signet): any free port will do
+	jsonLogs := os.Getenv("SIGNET_LOG") == "json"
+	if jsonLogs {
+		slog.SetDefault(slog.New(slog.NewJSONHandler(logw, &slog.HandlerOptions{ReplaceAttr: func(_ []string, a slog.Attr) slog.Attr {
+			switch a.Key {
+			case slog.MessageKey:
+				a.Key = "event"
+			case slog.LevelKey:
+				a.Value = slog.StringValue(strings.ToLower(a.Value.String()))
+			}
+			return a
+		}}).WithAttrs([]slog.Attr{slog.String("service", "signet"), slog.String("logger", "signet")})))
+	}
+	var ln net.Listener
+	var err error
+	if addr := os.Getenv("SIGNET_LISTEN"); addr != "" {
+		host, _, _ := net.SplitHostPort(addr)
+		if ip := net.ParseIP(host); (ip == nil || !ip.IsLoopback()) && strings.TrimSpace(os.Getenv("SIGNET_ACCESS_TEAM")) == "" {
+			return fmt.Errorf("refusing to listen on %s without a login in front: set SIGNET_ACCESS_TEAM, SIGNET_ACCESS_AUD and SIGNET_ACCESS_EMAIL (see access.go)", addr)
+		}
+		if ln, err = net.Listen("tcp", addr); err != nil {
+			return err
+		}
+	} else if ln, err = net.Listen("tcp", "127.0.0.1:"+preferredPort()); err != nil {
+		// taken (another program, or another account's Signet): any free port will do
 		if ln, err = net.Listen("tcp", "127.0.0.1:0"); err != nil {
 			return err
 		}
 	}
 	port := ln.Addr().(*net.TCPAddr).Port
 	idle := 10 * time.Minute
-	if m, err := strconv.Atoi(os.Getenv("SIGNET_IDLE")); err == nil && m > 0 {
+	if m, err := strconv.Atoi(os.Getenv("SIGNET_IDLE")); err == nil && m >= 0 {
 		idle = time.Duration(m) * time.Minute
 	}
 	h, err := newServer(dir)
@@ -429,7 +456,14 @@ func serve(dir string, logw *os.File) error {
 	srv := &http.Server{
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			last.Store(time.Now().UnixNano())
-			h.ServeHTTP(w, r)
+			if !jsonLogs || r.URL.Path == "/healthz" {
+				h.ServeHTTP(w, r)
+				return
+			}
+			start, sw := time.Now(), &statusWriter{ResponseWriter: w, status: 200}
+			h.ServeHTTP(sw, r)
+			slog.Info("http_request", "method", r.Method, "path", r.URL.Path, "status", sw.status,
+				"duration_ms", time.Since(start).Milliseconds(), "client", r.Header.Get("Cf-Connecting-Ip"))
 		}),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       2 * time.Minute,
@@ -449,7 +483,11 @@ func serve(dir string, logw *os.File) error {
 	}()
 	errc := make(chan error, 1)
 	go func() { errc <- srv.Serve(ln) }()
-	log.Printf("signet %s editor on http://127.0.0.1:%d (data in %s)", version, port, dir)
+	if jsonLogs {
+		slog.Info("editor_started", "version", version, "addr", ln.Addr().String(), "data", dir, "login", os.Getenv("SIGNET_ACCESS_TEAM") != "")
+	} else {
+		log.Printf("signet %s editor on http://%s (data in %s)", version, ln.Addr(), dir)
+	}
 	tick := time.NewTicker(time.Minute / 4)
 	defer tick.Stop()
 	for {
@@ -457,7 +495,7 @@ func serve(dir string, logw *os.File) error {
 		case err := <-errc:
 			return err
 		case <-tick.C:
-			if time.Since(time.Unix(0, last.Load())) > idle {
+			if idle > 0 && time.Since(time.Unix(0, last.Load())) > idle {
 				log.Printf("idle for %s, stopping", idle)
 				return srv.Close()
 			}
@@ -526,4 +564,30 @@ func findExe(name string) string {
 		return ""
 	}
 	return p
+}
+
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *statusWriter) WriteHeader(code int) { w.status = code; w.ResponseWriter.WriteHeader(code) }
+
+// health checks the editor answers (for Docker health checks: the image has no curl).
+func health() error {
+	addr := os.Getenv("SIGNET_LISTEN")
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil || port == "" {
+		port = preferredPort()
+	}
+	c := http.Client{Timeout: 4 * time.Second}
+	r, err := c.Get("http://127.0.0.1:" + port + "/healthz")
+	if err != nil {
+		return err
+	}
+	defer r.Body.Close()
+	if r.StatusCode != 200 {
+		return fmt.Errorf("health check answered %d", r.StatusCode)
+	}
+	return nil
 }

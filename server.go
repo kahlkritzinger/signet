@@ -10,6 +10,8 @@ package main
 //     session cookie that scripts can't read.
 //
 // Other accounts on the same computer, and websites you visit, get nothing.
+// On a server behind Cloudflare Access, the signed Access login counts too
+// (see access.go).
 //
 //	GET  /healthz?nonce=N            {"ok", "app": "signet", "version", "proof": HMAC(secret, N)}
 //	POST /api/launch                 a one-time code for opening a window (CLI only)
@@ -69,6 +71,8 @@ const csp = "default-src 'none'; script-src 'self'; worker-src 'self' blob:; sty
 type server struct {
 	dir      string
 	secret   []byte
+	access   *accessAuth     // set when running on a server behind Cloudflare Access
+	hosts    map[string]bool // extra hostnames allowed besides localhost
 	mu       sync.Mutex
 	sessions map[string]time.Time // session cookie -> created
 	codes    map[string]time.Time // one-time launch code -> expires
@@ -85,7 +89,20 @@ func newServer(dir string) (http.Handler, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := &server{dir: dir, secret: secret, sessions: map[string]time.Time{}, codes: map[string]time.Time{}}
+	access, err := accessFromEnv()
+	if err != nil {
+		return nil, err
+	}
+	s := &server{dir: dir, secret: secret, access: access, hosts: map[string]bool{},
+		sessions: map[string]time.Time{}, codes: map[string]time.Time{}}
+	for _, h := range strings.Split(os.Getenv("SIGNET_HOSTS"), ",") {
+		if h = strings.ToLower(strings.TrimSpace(h)); h != "" {
+			s.hosts[h] = true
+		}
+	}
+	if len(s.hosts) > 0 && s.access == nil {
+		return nil, fmt.Errorf("SIGNET_HOSTS lets other addresses in, so a login is needed: set SIGNET_ACCESS_TEAM, SIGNET_ACCESS_AUD and SIGNET_ACCESS_EMAIL")
+	}
 	web, _ := fs.Sub(webFS, "web")
 	files := http.FileServerFS(web)
 	mux := http.NewServeMux()
@@ -103,7 +120,7 @@ func newServer(dir string) (http.Handler, error) {
 		}
 		files.ServeHTTP(w, r)
 	})
-	return guard(mux), nil
+	return s.guard(mux), nil
 }
 
 // loadSecret reads ~/.signet/secret, making it (readable only by you) the first time.
@@ -149,7 +166,7 @@ func proof(secret []byte, nonce string) string {
 // guard applies to everything: only requests addressed to this machine (blocks
 // DNS rebinding), no writes from other websites, strict browser headers, and a
 // panic in one request never takes the editor down.
-func guard(next http.Handler) http.Handler {
+func (s *server) guard(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
 			if v := recover(); v != nil {
@@ -164,7 +181,7 @@ func guard(next http.Handler) http.Handler {
 		h.Set("Referrer-Policy", "no-referrer")
 		h.Set("Cross-Origin-Opener-Policy", "same-origin")
 		h.Set("Cross-Origin-Resource-Policy", "same-origin")
-		if !localHost(r.Host) {
+		if !localHost(r.Host) && !s.hosts[hostOnly(r.Host)] {
 			writeJSON(w, 403, map[string]string{"error": "local only"})
 			return
 		}
@@ -186,6 +203,13 @@ func guard(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+func hostOnly(hostport string) string {
+	if h, _, err := net.SplitHostPort(hostport); err == nil {
+		return strings.ToLower(h)
+	}
+	return strings.ToLower(hostport)
 }
 
 func localHost(hostport string) bool {
@@ -214,7 +238,7 @@ func (s *server) sessionOK(r *http.Request) bool {
 
 func (s *server) authed(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !s.cliOK(r) && !s.sessionOK(r) {
+		if !s.cliOK(r) && !s.sessionOK(r) && !(s.access != nil && s.access.email(r) != "") {
 			writeJSON(w, 401, map[string]string{"error": "not signed in: open the PDF with signet again"})
 			return
 		}

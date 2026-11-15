@@ -74,7 +74,7 @@ Types: `text`, `date`, `sign`, `initial`, `check`, `cross`. Inks: `black`, `blue
 - Your profile and signatures are two files in `~/.signet` (`SIGNET_DATA` to move them), readable only by you.
 - The editor listens on `127.0.0.1` only. Every request for your data must prove it's you: the CLI with a secret only your account can read (`~/.signet/secret`), the editor window with a one-time launch code. Other accounts on the same computer and websites you visit get nothing.
 - Before the CLI sends a PDF to the editor, the editor must prove it's really your Signet, so another program on the port can't intercept it.
-- Signet never connects to the internet.
+- Signet never connects to the internet. (On a server behind Cloudflare Access it fetches Access's public signing keys, nothing else.)
 
 ## Your data is safe
 
@@ -94,6 +94,30 @@ One Go binary with the editor built in. The editor is plain JavaScript in `web/`
 | `store.go` | profile and signature bank |
 | `setdefault.go` | `signet set-default` per platform |
 | `web/` | the editor |
+
+## Run it on a server
+
+To reach Signet from your phone, run it on a server behind [Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/policies/access/) (Zero Trust), which signs you in. Signet checks Access's signed token on every request and lets in only the emails you name. Without that it refuses to listen anywhere but `127.0.0.1`.
+
+```yaml
+# compose.yaml
+services:
+  signet:
+    image: ghcr.io/kahlkritzinger/signet:latest
+    restart: unless-stopped
+    user: "1000:1000"            # who owns ./data on the host
+    environment:
+      SIGNET_ACCESS_TEAM: myteam.cloudflareaccess.com
+      SIGNET_ACCESS_AUD: <your Access application's AUD tag>
+      SIGNET_ACCESS_EMAIL: me@example.com
+      SIGNET_HOSTS: signet.example.com
+    volumes:
+      - ./data:/data
+    ports:
+      - "127.0.0.1:8080:8080"    # reach it through a Cloudflare Tunnel, not the open internet
+```
+
+The image is tiny (just the binary, not root), logs one JSON object per line, and has a health check. On the server, the CLI uses the same data: `docker compose exec signet /signet profile`, or run the binary with `SIGNET_DATA` pointing at `./data`. In this mode Signet's only outgoing connection is fetching Access's public signing keys.
 
 ## Not yet
 
