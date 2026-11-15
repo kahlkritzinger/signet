@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Signet</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <div id="strip">
+    <div id="tabs"></div>
+    <button id="open" title="Open a PDF in a new tab (⌘O)">+ Open</button>
+  </div>
+  <div id="bar">
+    <div class="grp" id="tools">
+      <button data-tool="text" title="Type anywhere (T) — or double-click the page">Text</button>
+      <button data-tool="check" title="Check mark (C)">✓</button>
+      <button data-tool="cross" title="Cross (X)">✗</button>
+      <button data-tool="date" title="Today's date (D)">Date</button>
+      <button id="sigBtn" title="Signature (S)">Signature</button>
+      <button id="iniBtn" title="Initials (I)">Initials</button>
+      <button id="profBtn" title="Your details (P)">Profile</button>
+      <button data-tool="hl" title="Highlight or underline text (H)">Highlight</button>
+    </div>
+    <div class="grp seg">
+      <button id="undoBtn" title="Undo (⌘Z)"><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3.5 2.5 7 6 10.5"/><path d="M2.5 7h7a4 4 0 0 1 0 8H7"/></svg></button>
+      <button id="redoBtn" title="Redo (⇧⌘Z)"><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" style="transform:scaleX(-1)"><path d="M6 3.5 2.5 7 6 10.5"/><path d="M2.5 7h7a4 4 0 0 1 0 8H7"/></svg></button>
+    </div>
+    <span id="hint"></span>
+    <div class="grp seg">
+      <button id="zout" title="Zoom out">−</button>
+      <button id="zlabel" title="Fit width">100%</button>
+      <button id="zin" title="Zoom in">+</button>
+    </div>
+    <div class="grp" id="find">
+      <input id="q" type="search" placeholder="Search" autocomplete="off">
+      <span id="qcount"></span>
+      <button id="qprev" title="Previous">‹</button>
+      <button id="qnext" title="Next">›</button>
+    </div>
+    <button id="save" class="primary" title="Save the finished PDF (⌘S)">Download</button>
+  </div>
+</header>
+
+<main id="view">
+  <div id="drop"><b>Drop a PDF here</b><span>or click Open. Nothing leaves your computer.</span><span class="tip">Right-click the page for everything: text, profile, signature, initials, date, ✓ and ✗.</span></div>
+</main>
+
+<div id="bank" hidden></div>
+<div id="menu" hidden></div>
+<img id="ghost" alt="" hidden>
+
+<dialog id="maker">
+  <h3 id="makerTitle">New signature</h3>
+  <canvas id="pad" width="1600" height="600"></canvas>
+  <div class="row">
+    <button id="padInvent" class="accent">Invent one for me</button>
+    <button id="padPrev" title="Back to the previous one" disabled>‹ Previous</button>
+    <button id="padClear">Clear</button>
+    <button id="padUpload">Photo…</button>
+    <label id="cleanWrap" hidden>Clean-up <input id="clean" type="range" min="0" max="100" value="50"></label>
+    <span class="spacer"></span>
+    <button id="padCancel">Cancel</button>
+    <button id="padSave" class="primary">Save</button>
+  </div>
+  <p class="note">Keep clicking “Invent one for me” until one feels like yours, or draw your own with the mouse, trackpad or a pen.</p>
+</dialog>
+
+<dialog id="profile">
+  <h3>Your profile</h3>
+  <p class="note top">Fill in what you type on forms all the time. Add groups for anything else: a car, a company, a bank account.</p>
+  <div id="profBody"></div>
+  <div class="row">
+    <button id="profAddGroup">+ Add group</button>
+    <button id="profImport" title="Load a profile.json file">Import</button>
+    <button id="profExport" title="Save your profile as profile.json">Export</button>
+    <span class="spacer"></span>
+    <button id="profDone" class="primary">Done</button>
+  </div>
+</dialog>
+
+<dialog id="ask"><p id="askMsg"></p><div class="row" id="askBtns"></div></dialog>
+
+<input type="file" id="file" accept="application/pdf,.pdf" multiple hidden>
+<input type="file" id="imgFile" accept="image/*" hidden>
+<input type="file" id="jsonFile" accept="application/json,.json" hidden>
+
+<script src="vendor/pdf.min.js"></script>
+<script src="vendor/pdf-lib.min.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
