@@ -1,0 +1,10 @@
+name: Idea
+description: Something Signet should do
+labels: [idea]
+body:
+  - type: textarea
+    attributes:
+      label: What are you trying to do?
+      description: The job, not the button. Signet stays small, so the why matters most.
+    validations:
+      required: true

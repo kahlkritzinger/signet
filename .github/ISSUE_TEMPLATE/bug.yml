@@ -1,0 +1,20 @@
+name: Something's wrong
+description: A PDF that won't open, fill, sign or save, or anything else broken
+labels: [bug]
+body:
+  - type: textarea
+    attributes:
+      label: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Steps
+      placeholder: "1. signet lease.pdf  2. ..."
+  - type: input
+    attributes:
+      label: Signet version and system
+      placeholder: "signet version -> v0.1.0, macOS 15 / Windows 11 / Ubuntu 24.04"
+  - type: markdown
+    attributes:
+      value: "**Never attach a PDF with real personal details or your signature.** If a specific PDF breaks Signet, share a blank copy of the form or a PDF made to show the problem."

@@ -1,0 +1,9 @@
+Signet includes or uses the following open-source software.
+
+Bundled in web/vendor (the editor):
+- pdf.js (pdf.min.js, pdf.worker.min.js), Mozilla Foundation. Apache License 2.0. https://github.com/mozilla/pdf.js
+- pdf-lib (pdf-lib.min.js), Andrew Dillon. MIT License. https://github.com/Hopding/pdf-lib
+
+Go modules (the CLI):
+- pdfcpu, Horst Rutter. Apache License 2.0. https://github.com/pdfcpu/pdfcpu
+- ledongthuc/pdf, derived from rsc.io/pdf. BSD 3-Clause License. https://github.com/ledongthuc/pdf
