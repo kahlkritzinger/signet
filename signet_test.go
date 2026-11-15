@@ -483,3 +483,16 @@ func FuzzInspect(f *testing.F) {
 		find(p, "a")
 	})
 }
+
+// In a container the home folder may not exist or be read-only: the CLI must still work.
+func TestWorksWithoutAHomeFolder(t *testing.T) {
+	dir := testData(t)
+	t.Setenv("HOME", "/nonexistent")
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("APPDATA", "")
+	var p Plan
+	must(json.Unmarshal([]byte(`{"fields":{"tenant.name":"x"},"items":[{"type":"sign","page":1,"x":100,"y":100}]}`), &p))
+	if _, err := apply(sample, p, filepath.Join(t.TempDir(), "o.pdf"), dir, rand.New(rand.NewPCG(1, 1))); err != nil {
+		t.Fatal(err)
+	}
+}

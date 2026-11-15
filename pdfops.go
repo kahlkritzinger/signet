@@ -31,6 +31,10 @@ import (
 
 var bg = context.Background()
 
+// pdfcpu would otherwise create a settings folder in your home folder, which
+// fails where there is none (in a container, under a read-only home).
+func init() { api.DisableConfigDir() }
+
 var inks = map[string]color.NRGBA{
 	"black": {0x16, 0x16, 0x1a, 255},
 	"blue":  {0x1f, 0x3f, 0xae, 255},
@@ -99,7 +103,7 @@ func friendly(err error) error {
 func safely[T any](what string, f func() (T, error)) (out T, err error) {
 	defer func() {
 		if v := recover(); v != nil {
-			err = fmt.Errorf("could not %s: the PDF looks damaged or unusual (%v)", what, v)
+			err = fmt.Errorf("could not %s: the PDF looks damaged or unusual, or this is a bug in Signet (%v)", what, v)
 		}
 	}()
 	out, err = f()
