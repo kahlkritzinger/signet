@@ -17,6 +17,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -25,11 +26,13 @@ var version = "dev" // set by the release build
 const usage = `Signet: fill, sign and initial PDFs. Your signatures stay on your machine.
 
   signet [open] [FILE.pdf ...]       the editor, in its own window
+  signet set-default                 make Signet the app that opens PDFs
   signet inspect FILE [--pages 5]    Markdown: pages, form fields (name, x, y), text
   signet find FILE "Signature:"      where a phrase is (page, x, y), to place things by it
   signet profile                     what can be filled in: "Full name", "ID number", ...
   signet bank                        your signatures and initials
   signet apply FILE PLAN.json [--out OUT]   fill, write, sign, initial -> FILE-signed.pdf
+  signet serve                       run the editor in this terminal (it normally runs in the background)
   signet version
 
 Coordinates are PDF points from the TOP-LEFT of the page. PLAN.json:
@@ -48,7 +51,8 @@ Coordinates are PDF points from the TOP-LEFT of the page. PLAN.json:
   date formats: long (2 January 2026), short, iso, dmy
 
 Your profile and bank live in ~/.signet (SIGNET_DATA). Set them up once in the
-editor; the CLI reads them. The editor listens on 127.0.0.1:7766 (SIGNET_PORT).
+editor; the CLI reads them. The editor listens on 127.0.0.1:7766 (SIGNET_PORT)
+and stops by itself 10 minutes after its last window closes.
 `
 
 func main() {
@@ -67,6 +71,10 @@ func run(args []string) error {
 	switch cmd {
 	case "open":
 		return openEditor(args, dir)
+	case "serve":
+		return serve(dir, os.Stderr)
+	case "set-default":
+		return setDefault()
 	case "inspect":
 		fs := flag.NewFlagSet("inspect", flag.ContinueOnError)
 		pages := fs.Int("pages", 5, "pages of text to show")
@@ -249,14 +257,10 @@ func openEditor(files []string, dir string) error {
 		}
 		paths = append(paths, p)
 	}
-	started := false
 	if !running(base) {
-		ln, err := net.Listen("tcp", "127.0.0.1:"+port())
-		if err != nil {
-			return fmt.Errorf("port %s is busy (set SIGNET_PORT): %w", port(), err)
+		if err := startInBackground(dir, base); err != nil {
+			return err
 		}
-		go http.Serve(ln, newServer(dir))
-		started = true
 	}
 	var ids []string
 	for _, p := range paths {
@@ -276,11 +280,66 @@ func openEditor(files []string, dir string) error {
 		}
 	}
 	fmt.Println(u)
-	if !started {
-		return nil // the running editor has the files now
+	return nil
+}
+
+// startInBackground runs `signet serve` detached, so double-clicking a PDF
+// leaves no terminal behind, and waits until it answers.
+func startInBackground(dir, base string) error {
+	exe, err := os.Executable()
+	if err != nil {
+		return err
 	}
-	fmt.Fprintf(os.Stderr, "Signet is running (data in %s). Save writes NAME-signed.pdf next to the original. Ctrl+C to stop.\n", dir)
-	select {}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	logf, err := os.OpenFile(filepath.Join(dir, "signet.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	defer logf.Close()
+	c := exec.Command(exe, "serve")
+	c.Stdout, c.Stderr = logf, logf
+	detach(c)
+	if err := c.Start(); err != nil {
+		return err
+	}
+	c.Process.Release()
+	for i := 0; i < 100; i++ {
+		if running(base) {
+			return nil
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return fmt.Errorf("the editor did not start; see %s", filepath.Join(dir, "signet.log"))
+}
+
+// serve runs the editor until nothing has talked to it for SIGNET_IDLE minutes
+// (default 10). The editor page pings it every minute while it is open.
+func serve(dir string, logw *os.File) error {
+	ln, err := net.Listen("tcp", "127.0.0.1:"+port())
+	if err != nil {
+		return fmt.Errorf("port %s is busy (set SIGNET_PORT): %w", port(), err)
+	}
+	idle := 10 * time.Minute
+	if m, err := strconv.Atoi(os.Getenv("SIGNET_IDLE")); err == nil && m > 0 {
+		idle = time.Duration(m) * time.Minute
+	}
+	var last atomic.Int64
+	last.Store(time.Now().UnixNano())
+	h := newServer(dir)
+	go http.Serve(ln, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		last.Store(time.Now().UnixNano())
+		h.ServeHTTP(w, r)
+	}))
+	fmt.Fprintf(logw, "%s signet %s editor on http://127.0.0.1:%s (data in %s)\n", time.Now().Format(time.RFC3339), version, port(), dir)
+	for {
+		time.Sleep(time.Minute / 4)
+		if time.Since(time.Unix(0, last.Load())) > idle {
+			fmt.Fprintf(logw, "%s idle for %s, stopping\n", time.Now().Format(time.RFC3339), idle)
+			return nil
+		}
+	}
 }
 
 // openWindow shows the editor in its own window when Chrome, Edge, Brave or

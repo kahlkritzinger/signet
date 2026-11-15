@@ -135,10 +135,10 @@ func TestApplyDefaultsAndErrors(t *testing.T) {
 		t.Errorf("default name: %v %v", res, err)
 	}
 	cases := map[string]string{
-		`{"fields":{"nope":"x"}}`: "no form field named",
-		`{"items":[{"type":"sign","page":9,"x":0,"y":0}]}`: "page 9 is not in",
-		`{"items":[{"type":"sign","page":1,"x":0,"y":0,"ink":"green"}]}`: "ink must be",
-		`{"items":[{"type":"stamp","page":1,"x":0,"y":0}]}`: "unknown item type",
+		`{"fields":{"nope":"x"}}`:                                               "no form field named",
+		`{"items":[{"type":"sign","page":9,"x":0,"y":0}]}`:                      "page 9 is not in",
+		`{"items":[{"type":"sign","page":1,"x":0,"y":0,"ink":"green"}]}`:        "ink must be",
+		`{"items":[{"type":"stamp","page":1,"x":0,"y":0}]}`:                     "unknown item type",
 		`{"items":[{"type":"text","page":1,"x":0,"y":0,"profile":"Passport"}]}`: "profile has no",
 	}
 	for js, want := range cases {

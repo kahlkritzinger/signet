@@ -49,6 +49,7 @@ const store = {
         else if (local) this.set(k, local);
       } catch { return; }
     }
+    if (this.server) setInterval(() => fetch('healthz').catch(() => {}), 60000);   // keeps the local app running while this window is open
   },
 };
 const G = Object.assign({ ink: 'black', tink: 'black', fs: 11, font: 'helv', datefmt: 'long', size: { sig: 150, ini: 46 }, hl: 'yellow', hlMode: 'hl' }, store.get('prefs', {}));

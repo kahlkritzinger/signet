@@ -113,7 +113,10 @@ func fields(b []byte) ([]FieldInfo, error) {
 	return out, nil
 }
 
-type rect struct{ page int; x, y, w, h float64 }
+type rect struct {
+	page       int
+	x, y, w, h float64
+}
 
 // widgetRects finds where each form field sits: full field name -> first widget's rectangle.
 func widgetRects(b []byte) map[string]rect {
@@ -212,7 +215,10 @@ func pageLines(path string) ([][]Line, []types.Dim, error) {
 	return pages, dims, nil
 }
 
-type glyph struct{ s string; x, w, y, size float64 }
+type glyph struct {
+	s             string
+	x, w, y, size float64
+}
 
 func linesOf(pg lpdf.Page, height float64) (lines []Line) {
 	defer func() { recover() }() // a broken content stream must not stop the rest
