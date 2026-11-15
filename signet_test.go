@@ -380,6 +380,7 @@ func TestServeFindsAFreePortAndRecordsIt(t *testing.T) {
 	_, port, _ := strings.Cut(strings.TrimPrefix(busy.URL, "http://"), ":")
 	t.Setenv("SIGNET_PORT", port)
 	logf, _ := os.CreateTemp(t.TempDir(), "log")
+	t.Cleanup(func() { logf.Close() }) // Windows can't delete an open file
 	go serve(dir, logf)
 	secret, _ := loadSecret(dir) // racing serve to create it: both must end up with the same one
 	var base string
