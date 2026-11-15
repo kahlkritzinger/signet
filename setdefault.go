@@ -109,9 +109,21 @@ end run
 	}
 	exec.Command("codesign", "--force", "-s", "-", app).Run()
 	exec.Command("/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister", "-f", app).Run()
-	jxa := `ObjC.import("CoreServices"); $.LSSetDefaultRoleHandlerForContentType($("com.adobe.pdf"), 0xFFFFFFFF, $("dev.signet.app"))`
-	if out, err := exec.Command("osascript", "-l", "JavaScript", "-e", jxa).CombinedOutput(); err != nil || strings.TrimSpace(string(out)) != "0" {
-		fmt.Printf("Made %s. To make it the default: right-click a PDF > Get Info > Open with: Signet > Change All.\n", app)
+	// Ask, then check: macOS applies the change a few seconds later, and newer
+	// versions may ignore it, so only say "done" once it has really happened.
+	jxa := `ObjC.import("CoreServices");
+var want = "dev.signet.app", now = "";
+for (var i = 0; i < 40 && now !== want; i++) {
+  if (i % 8 === 0) $.LSSetDefaultRoleHandlerForContentType($("com.adobe.pdf"), 0xFFFFFFFF, $(want));
+  delay(0.25);
+  var h = $.LSCopyDefaultRoleHandlerForContentType($("com.adobe.pdf"), 0xFFFFFFFF);
+  now = h ? ObjC.castRefToObject(h).js : "";
+}
+now;`
+	out, err := exec.Command("osascript", "-l", "JavaScript", "-e", jxa).CombinedOutput()
+	if err != nil || strings.TrimSpace(string(out)) != "dev.signet.app" {
+		fmt.Printf("Made %s, but macOS did not let Signet make itself the default.\n", app)
+		fmt.Println("Do it once by hand: right-click a PDF > Get Info > Open with: Signet > Change All.")
 		return nil
 	}
 	fmt.Printf("Done: PDFs now open in Signet (%s).\n", app)
