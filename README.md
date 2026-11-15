@@ -27,6 +27,8 @@ irm https://raw.githubusercontent.com/kahlkritzinger/signet/main/install.ps1 | i
 
 **With Go:** `go install github.com/kahlkritzinger/signet@latest`. Or download the file for your computer from [Releases](https://github.com/kahlkritzinger/signet/releases).
 
+Every release file is checksummed and has a signed build attestation: `gh attestation verify signet-darwin-arm64 -R kahlkritzinger/signet` proves it was built by this repository's GitHub Actions from this source.
+
 Then make it your PDF app:
 
 ```sh
@@ -65,11 +67,20 @@ signet apply lease.pdf plan.json     # fill, write, sign, initial -> lease-signe
    {"type": "check",   "page": 2, "x": 60,  "y": 410}]}
 ```
 
-Types: `text`, `date`, `sign`, `initial`, `check`, `cross`. Inks: `black`, `blue` (signatures default), `red`. `signet help` has the rest. Your AI can use your signature without ever seeing it: `apply` reads it from your computer.
+Types: `text`, `date`, `sign`, `initial`, `check`, `cross`. Inks: `black`, `blue` (signatures default), `red`. Locked PDF: add `--password X`. Mistakes (a position off the page, characters the built-in font can't draw) are caught before anything is written. `signet help` has the rest. Your AI can use your signature without ever seeing it: `apply` reads it from your computer.
 
 ## Private by design
 
-Your profile and signatures are two files in `~/.signet` (`SIGNET_DATA` to move them). The editor runs on `127.0.0.1` and only answers requests addressed to your own machine, so websites you visit can't reach it. Signet never connects to the internet.
+- Your profile and signatures are two files in `~/.signet` (`SIGNET_DATA` to move them), readable only by you.
+- The editor listens on `127.0.0.1` only. Every request for your data must prove it's you: the CLI with a secret only your account can read (`~/.signet/secret`), the editor window with a one-time launch code. Other accounts on the same computer and websites you visit get nothing.
+- Before the CLI sends a PDF to the editor, the editor must prove it's really your Signet, so another program on the port can't intercept it.
+- Signet never connects to the internet.
+
+## Your data is safe
+
+- Saves are crash-safe: a power cut leaves the old file or the new one, never half of each.
+- Every change to your profile or signatures keeps the previous version in `~/.signet/backups` (the last 10). A damaged file is restored from the newest good backup automatically.
+- `signet apply` never touches the original, checks the result is a valid PDF before writing it, and stops with a clear message on a damaged, locked or unusual PDF instead of crashing or hanging.
 
 ## How it works
 
@@ -87,7 +98,8 @@ One Go binary with the editor built in. The editor is plain JavaScript in `web/`
 ## Not yet
 
 - Scanned PDFs: no text to search, but you can still place everything by hand
-- Locked PDFs need their password; some encrypted PDFs can't be saved yet
+- Locked PDFs: the CLI takes `--password`; the editor asks for it, but some encrypted PDFs can't be saved yet
+- Text placed by the CLI uses Helvetica, so it's limited to Latin letters (accents are fine)
 - Dropdown fields filled by the CLI may look empty in some viewers until clicked (the value is saved)
 - The Mac and Windows downloads aren't code-signed, so the first open may need *Open anyway* (Mac: System Settings > Privacy & Security). The install scripts avoid this.
 

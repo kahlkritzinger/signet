@@ -168,7 +168,7 @@ async function closeDoc(D) {
 async function openBytes(buf, name, src) {   // src: the server's id for this file, when it came from `signet open`
   const bytes = new Uint8Array(buf);
   let cancelled = false;
-  const task = pdfjsLib.getDocument({ data: bytes.slice() });
+  const task = pdfjsLib.getDocument({ data: bytes.slice(), isEvalSupported: false });   // no eval: the page runs under a strict security policy
   task.onPassword = (cb, reason) => {
     const p = prompt(reason === 1 ? 'This PDF is locked. Password:' : 'Wrong password — try again:');
     if (p === null) { cancelled = true; task.destroy(); } else cb(p);
@@ -1297,7 +1297,7 @@ window.signet = {
   for (const id of (qs.get('doc') || '').split(',').filter(Boolean)) {
     try {
       const r = await fetch('api/doc/' + encodeURIComponent(id));
-      if (!r.ok) throw new Error('the file is no longer available — open it again');
+      if (!r.ok) throw new Error(r.status === 401 ? 'this window has expired — open the PDF with Signet again' : 'the file is no longer available — open it again');
       await openBytes(await r.arrayBuffer(), decodeURIComponent(r.headers.get('X-Name') || 'document.pdf'), id);
     } catch (e) { alert('Could not open the PDF: ' + e.message); }
   }

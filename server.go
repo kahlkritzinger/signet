@@ -1,22 +1,38 @@
 package main
 
-// The editor's local server. It only listens on 127.0.0.1 and only answers
-// requests addressed to localhost, so websites you visit can't reach it.
+// The editor's local server. It listens on 127.0.0.1 only, and every request
+// for your data must prove it comes from you:
 //
-//	GET  /healthz                    {"ok": true, "app": "signet"}
+//   - the CLI sends the secret in ~/.signet/secret (readable only by you), and
+//     before it sends anything it makes the server prove it knows the secret
+//     too, so another program on the port can't pretend to be Signet;
+//   - the editor window is opened with a one-time launch code, swapped for a
+//     session cookie that scripts can't read.
+//
+// Other accounts on the same computer, and websites you visit, get nothing.
+//
+//	GET  /healthz?nonce=N            {"ok", "app": "signet", "version", "proof": HMAC(secret, N)}
+//	POST /api/launch                 a one-time code for opening a window (CLI only)
+//	GET  /?k=CODE&doc=...            swaps the code for a session, then shows the editor
 //	GET  /api/store/{bank|profile}   your signature bank / profile (JSON)
 //	PUT  /api/store/{bank|profile}
 //	POST /api/docs?name=&path=       hand a PDF to the editor -> {"id": ...}
 //	GET  /api/doc/{id}               the PDF (name in X-Name)
 //	POST /api/save/{id}              write <name>-signed.pdf next to the original
-//	GET  /                           the editor
+//	GET  /                           the editor (its files hold no data)
 
 import (
 	"bytes"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
 	"embed"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"log"
@@ -26,7 +42,9 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime/debug"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -34,14 +52,27 @@ import (
 var webFS embed.FS
 
 const (
-	maxPDF   = 100 << 20
-	maxStore = 20 << 20
-	docTTL   = 48 * time.Hour
+	maxPDF      = 100 << 20
+	maxStore    = 20 << 20
+	docTTL      = 48 * time.Hour
+	codeTTL     = 2 * time.Minute
+	maxSessions = 64
+	cookieName  = "signet"
 )
 
 var docID = regexp.MustCompile(`^[A-Za-z0-9_-]{16,64}$`)
 
-type server struct{ dir string }
+const csp = "default-src 'none'; script-src 'self'; worker-src 'self' blob:; style-src 'self' 'unsafe-inline'; " +
+	"img-src 'self' data: blob:; font-src 'self' data: blob:; connect-src 'self' data: blob:; " +
+	"frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
+
+type server struct {
+	dir      string
+	secret   []byte
+	mu       sync.Mutex
+	sessions map[string]time.Time // session cookie -> created
+	codes    map[string]time.Time // one-time launch code -> expires
+}
 
 type docMeta struct {
 	Name  string `json:"name"`
@@ -49,28 +80,96 @@ type docMeta struct {
 	Saved string `json:"saved,omitempty"` // where we saved it last, so saving again overwrites our own file
 }
 
-func newServer(dir string) http.Handler {
-	s := &server{dir: dir}
+func newServer(dir string) (http.Handler, error) {
+	secret, err := loadSecret(dir)
+	if err != nil {
+		return nil, err
+	}
+	s := &server{dir: dir, secret: secret, sessions: map[string]time.Time{}, codes: map[string]time.Time{}}
 	web, _ := fs.Sub(webFS, "web")
+	files := http.FileServerFS(web)
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, 200, map[string]any{"ok": true, "app": "signet", "version": version})
+	mux.HandleFunc("GET /healthz", s.health)
+	mux.HandleFunc("POST /api/launch", s.cliOnly(s.launch))
+	mux.HandleFunc("GET /api/store/{key}", s.authed(s.storeGet))
+	mux.HandleFunc("PUT /api/store/{key}", s.authed(s.storePut))
+	mux.HandleFunc("POST /api/docs", s.authed(s.docUpload))
+	mux.HandleFunc("GET /api/doc/{id}", s.authed(s.docGet))
+	mux.HandleFunc("POST /api/save/{id}", s.authed(s.docSave))
+	mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/" && r.URL.Query().Has("k") {
+			s.redeem(w, r)
+			return
+		}
+		files.ServeHTTP(w, r)
 	})
-	mux.HandleFunc("GET /api/store/{key}", s.storeGet)
-	mux.HandleFunc("PUT /api/store/{key}", s.storePut)
-	mux.HandleFunc("POST /api/docs", s.docUpload)
-	mux.HandleFunc("GET /api/doc/{id}", s.docGet)
-	mux.HandleFunc("POST /api/save/{id}", s.docSave)
-	mux.Handle("GET /", http.FileServerFS(web))
-	return gate(mux)
+	return guard(mux), nil
 }
 
-// gate: only requests addressed to this machine (blocks DNS rebinding), and
-// writes only from this page (blocks other websites posting to us).
-func gate(next http.Handler) http.Handler {
+// loadSecret reads ~/.signet/secret, making it (readable only by you) the first time.
+func loadSecret(dir string) ([]byte, error) {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, err
+	}
+	p := filepath.Join(dir, "secret")
+	b, err := os.ReadFile(p)
+	if err == nil && len(bytes.TrimSpace(b)) >= 32 {
+		return bytes.TrimSpace(b), nil
+	}
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return nil, err
+	}
+	// Create it exclusively: if two Signets start at once, the first one wins
+	// and the other reads its secret.
+	tmp := p + "." + newID() + ".tmp"
+	if err := writeAtomic(tmp, []byte(hex.EncodeToString(raw)), 0o600); err != nil {
+		return nil, err
+	}
+	defer os.Remove(tmp)
+	if err := os.Link(tmp, p); err != nil && !errors.Is(err, os.ErrExist) {
+		return nil, err
+	}
+	b, err = os.ReadFile(p)
+	if err != nil || len(bytes.TrimSpace(b)) < 32 {
+		return nil, fmt.Errorf("could not read %s", p)
+	}
+	return bytes.TrimSpace(b), nil
+}
+
+func proof(secret []byte, nonce string) string {
+	m := hmac.New(sha256.New, secret)
+	m.Write([]byte("signet-proof:" + nonce))
+	return hex.EncodeToString(m.Sum(nil))
+}
+
+// guard applies to everything: only requests addressed to this machine (blocks
+// DNS rebinding), no writes from other websites, strict browser headers, and a
+// panic in one request never takes the editor down.
+func guard(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if v := recover(); v != nil {
+				log.Printf("panic serving %s %s: %v\n%s", r.Method, r.URL.Path, v, debug.Stack())
+				writeJSON(w, 500, map[string]string{"error": "internal error"})
+			}
+		}()
+		h := w.Header()
+		h.Set("Content-Security-Policy", csp)
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("X-Frame-Options", "DENY")
+		h.Set("Referrer-Policy", "no-referrer")
+		h.Set("Cross-Origin-Opener-Policy", "same-origin")
+		h.Set("Cross-Origin-Resource-Policy", "same-origin")
 		if !localHost(r.Host) {
 			writeJSON(w, 403, map[string]string{"error": "local only"})
+			return
+		}
+		if site := r.Header.Get("Sec-Fetch-Site"); site == "cross-site" || site == "same-site" {
+			writeJSON(w, 403, map[string]string{"error": "wrong origin"})
 			return
 		}
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
@@ -82,6 +181,9 @@ func gate(next http.Handler) http.Handler {
 				}
 			}
 		}
+		if strings.HasPrefix(r.URL.Path, "/api/") {
+			h.Set("Cache-Control", "no-store")
+		}
 		next.ServeHTTP(w, r)
 	})
 }
@@ -91,7 +193,97 @@ func localHost(hostport string) bool {
 	if err != nil {
 		h = hostport
 	}
-	return h == "127.0.0.1" || h == "localhost" || h == "::1"
+	return h == "127.0.0.1" || h == "localhost" || h == "::1" || h == "[::1]"
+}
+
+func (s *server) cliOK(r *http.Request) bool {
+	tok, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+	return ok && subtle.ConstantTimeCompare([]byte(tok), s.secret) == 1
+}
+
+func (s *server) sessionOK(r *http.Request) bool {
+	c, err := r.Cookie(cookieName)
+	if err != nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.sessions[c.Value]
+	return ok
+}
+
+func (s *server) authed(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !s.cliOK(r) && !s.sessionOK(r) {
+			writeJSON(w, 401, map[string]string{"error": "not signed in: open the PDF with signet again"})
+			return
+		}
+		h(w, r)
+	}
+}
+
+func (s *server) cliOnly(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !s.cliOK(r) {
+			writeJSON(w, 401, map[string]string{"error": "not allowed"})
+			return
+		}
+		h(w, r)
+	}
+}
+
+func (s *server) health(w http.ResponseWriter, r *http.Request) {
+	res := map[string]any{"ok": true, "app": "signet", "version": version}
+	if n := r.URL.Query().Get("nonce"); n != "" && len(n) <= 128 {
+		res["proof"] = proof(s.secret, n)
+	}
+	writeJSON(w, 200, res)
+}
+
+func (s *server) launch(w http.ResponseWriter, r *http.Request) {
+	code := newID()
+	s.mu.Lock()
+	now := time.Now()
+	for c, exp := range s.codes {
+		if now.After(exp) {
+			delete(s.codes, c)
+		}
+	}
+	s.codes[code] = now.Add(codeTTL)
+	s.mu.Unlock()
+	writeJSON(w, 200, map[string]string{"code": code})
+}
+
+// redeem swaps a one-time launch code for a session cookie, then drops the
+// code from the address bar.
+func (s *server) redeem(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	code := q.Get("k")
+	q.Del("k")
+	s.mu.Lock()
+	exp, ok := s.codes[code]
+	delete(s.codes, code) // single use, valid or not
+	if ok && time.Now().Before(exp) {
+		if len(s.sessions) >= maxSessions { // forget the oldest window
+			var oldest string
+			var t time.Time
+			for k, v := range s.sessions {
+				if oldest == "" || v.Before(t) {
+					oldest, t = k, v
+				}
+			}
+			delete(s.sessions, oldest)
+		}
+		sess := newID() + newID()
+		s.sessions[sess] = time.Now()
+		http.SetCookie(w, &http.Cookie{Name: cookieName, Value: sess, Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode})
+	}
+	s.mu.Unlock()
+	target := "/"
+	if len(q) > 0 {
+		target += "?" + q.Encode()
+	}
+	http.Redirect(w, r, target, http.StatusSeeOther)
 }
 
 func (s *server) storeGet(w http.ResponseWriter, r *http.Request) {
@@ -109,7 +301,6 @@ func (s *server) storeGet(w http.ResponseWriter, r *http.Request) {
 		b = []byte("null")
 	}
 	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Cache-Control", "no-store")
 	w.Write(b)
 }
 
@@ -119,16 +310,37 @@ func (s *server) storePut(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 404, map[string]string{"error": "unknown"})
 		return
 	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxStore+1))
-	if err != nil || len(body) == 0 || len(body) > maxStore {
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxStore))
+	if err != nil || len(body) == 0 {
 		writeJSON(w, 413, map[string]string{"error": "empty or too big"})
 		return
 	}
-	if err := writeStore(s.dir, key, body); err != nil {
+	if err := checkStore(key, body); err != nil {
 		writeJSON(w, 400, map[string]string{"error": err.Error()})
 		return
 	}
+	if err := writeStore(s.dir, key, body); err != nil {
+		writeJSON(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
 	writeJSON(w, 200, true)
+}
+
+// checkStore refuses data the editor would never send, so a bug can't wipe a good bank.
+func checkStore(key string, body []byte) error {
+	switch key {
+	case "bank":
+		var marks []Mark
+		if err := json.Unmarshal(body, &marks); err != nil {
+			return fmt.Errorf("bank must be a list of marks")
+		}
+	case "profile":
+		var p Profile
+		if err := json.Unmarshal(body, &p); err != nil {
+			return fmt.Errorf("profile must have groups of fields")
+		}
+	}
+	return nil
 }
 
 func (s *server) docsDir() string {
@@ -147,8 +359,8 @@ func (s *server) prune() {
 }
 
 func (s *server) docUpload(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxPDF+1))
-	if err != nil || len(body) > maxPDF {
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxPDF))
+	if err != nil {
 		writeJSON(w, 413, map[string]string{"error": "too big"})
 		return
 	}
@@ -162,8 +374,8 @@ func (s *server) docUpload(w http.ResponseWriter, r *http.Request) {
 		name = "document.pdf"
 	}
 	meta := docMeta{Name: name}
-	if p := r.URL.Query().Get("path"); p != "" && filepath.IsAbs(p) {
-		meta.Path = p
+	if p := r.URL.Query().Get("path"); p != "" && filepath.IsAbs(p) && s.cliOK(r) {
+		meta.Path = filepath.Clean(p) // only the CLI may say where a file lives on disk
 	}
 	id := newID()
 	if err := writeAtomic(filepath.Join(s.docsDir(), id+".pdf"), body, 0o600); err != nil {
@@ -205,7 +417,6 @@ func (s *server) docGet(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/pdf")
 	w.Header().Set("X-Name", url.PathEscape(m.Name))
-	w.Header().Set("Cache-Control", "no-store")
 	w.Write(b)
 }
 
@@ -216,16 +427,24 @@ func (s *server) docSave(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 404, map[string]string{"error": "no original on disk"})
 		return
 	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxPDF+1))
-	if err != nil || len(body) > maxPDF || !bytes.HasPrefix(body, []byte("%PDF")) {
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxPDF))
+	if err != nil || !bytes.HasPrefix(body, []byte("%PDF")) {
 		writeJSON(w, 400, map[string]string{"error": "not a PDF"})
 		return
 	}
 	out := m.Saved
-	if out == "" {
+	if out == "" || !exists(out) {
 		out = freeName(m.Path)
 	}
-	if err := writeAtomic(out, body, 0o644); err != nil {
+	if out == m.Path {
+		writeJSON(w, 500, map[string]string{"error": "refusing to overwrite the original"})
+		return
+	}
+	mode := os.FileMode(0o644)
+	if info, err := os.Stat(m.Path); err == nil {
+		mode = info.Mode().Perm() // the signed copy is as private as the original
+	}
+	if err := writeAtomic(out, body, mode); err != nil {
 		writeJSON(w, 500, map[string]string{"error": "could not write " + out + ": " + err.Error()})
 		return
 	}
@@ -244,7 +463,7 @@ func freeName(original string) string {
 	return out
 }
 
-func exists(p string) bool { _, err := os.Stat(p); return err == nil }
+func exists(p string) bool { _, err := os.Lstat(p); return err == nil }
 
 func newID() string {
 	b := make([]byte, 18)

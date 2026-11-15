@@ -4,9 +4,12 @@ package main
 
 import (
 	"bytes"
+	"crypto/hmac"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
+	"log"
 	"math/rand/v2"
 	"net"
 	"net/http"
@@ -35,6 +38,8 @@ const usage = `Signet: fill, sign and initial PDFs. Your signatures stay on your
   signet serve                       run the editor in this terminal (it normally runs in the background)
   signet version
 
+  Locked PDF? Add --password X (or set SIGNET_PDF_PASSWORD) to inspect, find or apply.
+
 Coordinates are PDF points from the TOP-LEFT of the page. PLAN.json:
 
   {"fields": {"tenant.name": {"profile": "Full name"}, "agree": true, "term": "12 months"},
@@ -52,7 +57,8 @@ Coordinates are PDF points from the TOP-LEFT of the page. PLAN.json:
 
 Your profile and bank live in ~/.signet (SIGNET_DATA). Set them up once in the
 editor; the CLI reads them. The editor listens on 127.0.0.1:7766 (SIGNET_PORT)
-and stops by itself 10 minutes after its last window closes.
+and stops by itself 10 minutes after its last window closes. Only you can reach it:
+the CLI proves itself with ~/.signet/secret, the window with a one-time code.
 `
 
 func main() {
@@ -68,6 +74,18 @@ func run(args []string) error {
 		cmd, args = args[0], args[1:]
 	}
 	dir := dataDir()
+	args = takePassword(args)
+	switch cmd {
+	case "inspect", "find", "apply": // a pathological PDF must never hang an AI's terminal forever
+		limit := 2 * time.Minute
+		if s, err := strconv.Atoi(os.Getenv("SIGNET_TIMEOUT")); err == nil && s > 0 {
+			limit = time.Duration(s) * time.Second
+		}
+		time.AfterFunc(limit, func() {
+			fmt.Fprintf(os.Stderr, "signet: gave up after %s; this PDF is too large or unusual (SIGNET_TIMEOUT=seconds to wait longer)\n", limit)
+			os.Exit(2)
+		})
+	}
 	switch cmd {
 	case "open":
 		return openEditor(args, dir)
@@ -171,6 +189,25 @@ func run(args []string) error {
 	return fmt.Errorf("unknown command %q (signet help)", cmd)
 }
 
+// takePassword pulls --password X (or --password=X) out of the arguments.
+func takePassword(args []string) []string {
+	var out []string
+	for i := 0; i < len(args); i++ {
+		switch a := args[i]; {
+		case a == "--password" || a == "-password":
+			if i+1 < len(args) {
+				pdfPassword = args[i+1]
+				i++
+			}
+		case strings.HasPrefix(a, "--password="):
+			pdfPassword = strings.TrimPrefix(a, "--password=")
+		default:
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
 func oneFile(fs *flag.FlagSet, args []string) (string, error) {
 	var file string
 	for len(args) > 0 {
@@ -208,44 +245,83 @@ func itoa(n int) string { return strconv.Itoa(n) }
 
 // ---------- the editor ----------
 
-func port() string {
+// editorFile records where this user's editor is listening, so a busy port
+// (another program, or another account's Signet) never gets in the way.
+type editorInfo struct {
+	Port int `json:"port"`
+	PID  int `json:"pid"`
+}
+
+func editorPath(dir string) string { return filepath.Join(dir, "editor.json") }
+
+func preferredPort() string {
 	if p := os.Getenv("SIGNET_PORT"); p != "" {
 		return p
 	}
 	return "7766"
 }
 
-func running(base string) bool {
-	c := http.Client{Timeout: time.Second}
-	r, err := c.Get(base + "/healthz")
+// verified reports whether the server at base is this user's Signet: it must
+// prove it knows the secret in ~/.signet/secret before we send it anything.
+func verified(base string, secret []byte) bool {
+	nonce := newID()
+	c := http.Client{Timeout: 2 * time.Second}
+	r, err := c.Get(base + "/healthz?nonce=" + nonce)
 	if err != nil {
 		return false
 	}
 	defer r.Body.Close()
-	var h struct{ App string }
-	return json.NewDecoder(r.Body).Decode(&h) == nil && h.App == "signet"
+	var h struct{ App, Proof string }
+	if json.NewDecoder(io.LimitReader(r.Body, 1<<16)).Decode(&h) != nil || h.App != "signet" {
+		return false
+	}
+	return hmac.Equal([]byte(h.Proof), []byte(proof(secret, nonce)))
 }
 
-func send(base, path string) (string, error) {
-	b, err := readPDF(path)
-	if err != nil {
-		return "", err
+// findEditor returns the address of this user's running editor, if there is one.
+func findEditor(dir string, secret []byte) (string, bool) {
+	var ports []string
+	if b, err := os.ReadFile(editorPath(dir)); err == nil {
+		var e editorInfo
+		if json.Unmarshal(b, &e) == nil && e.Port > 0 {
+			ports = append(ports, strconv.Itoa(e.Port))
+		}
 	}
-	q := url.Values{"name": {filepath.Base(path)}, "path": {path}}
-	r, err := http.Post(base+"/api/docs?"+q.Encode(), "application/pdf", bytes.NewReader(b))
+	ports = append(ports, preferredPort())
+	for _, p := range ports {
+		base := "http://127.0.0.1:" + p
+		if verified(base, secret) {
+			return base, true
+		}
+	}
+	return "", false
+}
+
+func call(method, url string, secret []byte, body []byte, ctype string, out any) error {
+	req, err := http.NewRequest(method, url, bytes.NewReader(body))
 	if err != nil {
-		return "", err
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+string(secret))
+	if ctype != "" {
+		req.Header.Set("Content-Type", ctype)
+	}
+	c := http.Client{Timeout: 60 * time.Second}
+	r, err := c.Do(req)
+	if err != nil {
+		return err
 	}
 	defer r.Body.Close()
-	var res struct{ ID, Error string }
-	if err := json.NewDecoder(r.Body).Decode(&res); err != nil || res.ID == "" {
-		return "", fmt.Errorf("the editor refused %s: %s", path, res.Error)
+	var res map[string]any
+	dec := json.NewDecoder(io.LimitReader(r.Body, 1<<20))
+	if r.StatusCode != 200 {
+		dec.Decode(&res)
+		return fmt.Errorf("the editor said %d: %v", r.StatusCode, res["error"])
 	}
-	return res.ID, nil
+	return dec.Decode(out)
 }
 
 func openEditor(files []string, dir string) error {
-	base := "http://127.0.0.1:" + port()
 	var paths []string
 	for _, f := range files {
 		p, err := filepath.Abs(f)
@@ -257,23 +333,35 @@ func openEditor(files []string, dir string) error {
 		}
 		paths = append(paths, p)
 	}
-	if !running(base) {
-		if err := startInBackground(dir, base); err != nil {
+	secret, err := loadSecret(dir)
+	if err != nil {
+		return err
+	}
+	base, ok := findEditor(dir, secret)
+	if !ok {
+		if base, err = startInBackground(dir, secret); err != nil {
 			return err
 		}
 	}
 	var ids []string
 	for _, p := range paths {
-		id, err := send(base, p)
-		if err != nil {
-			return err
+		b, _ := readPDF(p)
+		q := url.Values{"name": {filepath.Base(p)}, "path": {p}}
+		var res struct{ ID string }
+		if err := call("POST", base+"/api/docs?"+q.Encode(), secret, b, "application/pdf", &res); err != nil {
+			return fmt.Errorf("could not open %s: %w", p, err)
 		}
-		ids = append(ids, id)
+		ids = append(ids, res.ID)
 	}
-	u := base + "/"
+	var launch struct{ Code string }
+	if err := call("POST", base+"/api/launch", secret, nil, "", &launch); err != nil {
+		return err
+	}
+	q := url.Values{"k": {launch.Code}}
 	if len(ids) > 0 {
-		u += "?doc=" + strings.Join(ids, ",")
+		q.Set("doc", strings.Join(ids, ","))
 	}
+	u := base + "/?" + q.Encode()
 	if os.Getenv("SIGNET_NO_WINDOW") == "" {
 		if err := openWindow(u); err != nil {
 			fmt.Fprintln(os.Stderr, "signet: could not open a window:", err)
@@ -284,60 +372,95 @@ func openEditor(files []string, dir string) error {
 }
 
 // startInBackground runs `signet serve` detached, so double-clicking a PDF
-// leaves no terminal behind, and waits until it answers.
-func startInBackground(dir, base string) error {
+// leaves no terminal behind, and waits until it answers with the right proof.
+func startInBackground(dir string, secret []byte) (string, error) {
 	exe, err := os.Executable()
 	if err != nil {
-		return err
+		return "", err
 	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
+	logPath := filepath.Join(dir, "signet.log")
+	if info, err := os.Stat(logPath); err == nil && info.Size() > 1<<20 { // keep the log small
+		os.Rename(logPath, logPath+".old")
 	}
-	logf, err := os.OpenFile(filepath.Join(dir, "signet.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	logf, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer logf.Close()
+	os.Remove(editorPath(dir))
 	c := exec.Command(exe, "serve")
 	c.Stdout, c.Stderr = logf, logf
+	c.Env = append(os.Environ(), "SIGNET_DATA="+dir)
 	detach(c)
 	if err := c.Start(); err != nil {
-		return err
+		return "", err
 	}
 	c.Process.Release()
-	for i := 0; i < 100; i++ {
-		if running(base) {
-			return nil
+	for i := 0; i < 200; i++ {
+		if base, ok := findEditor(dir, secret); ok {
+			return base, nil
 		}
-		time.Sleep(50 * time.Millisecond)
+		time.Sleep(25 * time.Millisecond)
 	}
-	return fmt.Errorf("the editor did not start; see %s", filepath.Join(dir, "signet.log"))
+	return "", fmt.Errorf("the editor did not start; see %s", logPath)
 }
 
 // serve runs the editor until nothing has talked to it for SIGNET_IDLE minutes
 // (default 10). The editor page pings it every minute while it is open.
 func serve(dir string, logw *os.File) error {
-	ln, err := net.Listen("tcp", "127.0.0.1:"+port())
-	if err != nil {
-		return fmt.Errorf("port %s is busy (set SIGNET_PORT): %w", port(), err)
+	log.SetOutput(logw)
+	ln, err := net.Listen("tcp", "127.0.0.1:"+preferredPort())
+	if err != nil { // taken (another program, or another account's Signet): any free port will do
+		if ln, err = net.Listen("tcp", "127.0.0.1:0"); err != nil {
+			return err
+		}
 	}
+	port := ln.Addr().(*net.TCPAddr).Port
 	idle := 10 * time.Minute
 	if m, err := strconv.Atoi(os.Getenv("SIGNET_IDLE")); err == nil && m > 0 {
 		idle = time.Duration(m) * time.Minute
 	}
+	h, err := newServer(dir)
+	if err != nil {
+		return err
+	}
 	var last atomic.Int64
 	last.Store(time.Now().UnixNano())
-	h := newServer(dir)
-	go http.Serve(ln, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		last.Store(time.Now().UnixNano())
-		h.ServeHTTP(w, r)
-	}))
-	fmt.Fprintf(logw, "%s signet %s editor on http://127.0.0.1:%s (data in %s)\n", time.Now().Format(time.RFC3339), version, port(), dir)
+	srv := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			last.Store(time.Now().UnixNano())
+			h.ServeHTTP(w, r)
+		}),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       2 * time.Minute,
+		WriteTimeout:      2 * time.Minute,
+		IdleTimeout:       2 * time.Minute,
+		MaxHeaderBytes:    64 << 10,
+		ErrorLog:          log.Default(),
+	}
+	info, _ := json.Marshal(editorInfo{Port: port, PID: os.Getpid()})
+	if err := writeAtomic(editorPath(dir), info, 0o600); err != nil {
+		return err
+	}
+	defer func() { // forget our address, unless a newer editor has taken over
+		if b, err := os.ReadFile(editorPath(dir)); err == nil && bytes.Equal(b, info) {
+			os.Remove(editorPath(dir))
+		}
+	}()
+	errc := make(chan error, 1)
+	go func() { errc <- srv.Serve(ln) }()
+	log.Printf("signet %s editor on http://127.0.0.1:%d (data in %s)", version, port, dir)
+	tick := time.NewTicker(time.Minute / 4)
+	defer tick.Stop()
 	for {
-		time.Sleep(time.Minute / 4)
-		if time.Since(time.Unix(0, last.Load())) > idle {
-			fmt.Fprintf(logw, "%s idle for %s, stopping\n", time.Now().Format(time.RFC3339), idle)
-			return nil
+		select {
+		case err := <-errc:
+			return err
+		case <-tick.C:
+			if time.Since(time.Unix(0, last.Load())) > idle {
+				log.Printf("idle for %s, stopping", idle)
+				return srv.Close()
+			}
 		}
 	}
 }

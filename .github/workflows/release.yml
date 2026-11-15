@@ -1,4 +1,6 @@
-# Push a tag like v0.1.0 to publish a release with one file per platform.
+# Push a tag like v0.2.0 to publish a release with one file per platform.
+# Each file gets a signed build provenance attestation, so anyone can check it
+# was built here from this source: gh attestation verify FILE -R kahlkritzinger/signet
 name: release
 
 on:
@@ -7,6 +9,8 @@ on:
 
 permissions:
   contents: write
+  id-token: write
+  attestations: write
 
 jobs:
   release:
@@ -16,7 +20,8 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - run: go test ./...
+      - run: go test -race ./...
+      - run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
       - name: build
         run: |
           mkdir dist
@@ -26,6 +31,9 @@ jobs:
               -ldflags "-s -w -X main.version=${GITHUB_REF_NAME}" -o "dist/signet-$os-$arch$ext" .
           done
           cd dist && sha256sum signet-* > checksums.txt
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: "dist/signet-*"
       - name: publish
         env:
           GH_TOKEN: ${{ github.token }}

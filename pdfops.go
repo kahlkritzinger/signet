@@ -48,21 +48,62 @@ var (
 	dateFormats  = map[string]string{"long": "2 January 2006", "iso": "2006-01-02", "dmy": "02/01/2006", "short": "2 Jan 2006"}
 )
 
+// pdfPassword opens locked PDFs (--password, or SIGNET_PDF_PASSWORD).
+var pdfPassword = os.Getenv("SIGNET_PDF_PASSWORD")
+
 func conf() *model.Configuration {
 	c := model.NewDefaultConfiguration()
 	c.ValidationMode = model.ValidationRelaxed
+	c.UserPW, c.OwnerPW = pdfPassword, pdfPassword
 	return c
 }
 
+const maxInput = 200 << 20
+
 func readPDF(path string) ([]byte, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	if info.IsDir() || info.Size() > maxInput {
+		return nil, fmt.Errorf("%s is not a PDF Signet can open (folder, or over 200 MB)", path)
+	}
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-	if !bytes.HasPrefix(b, []byte("%PDF")) {
+	if !bytes.HasPrefix(bytes.TrimLeft(b[:min(len(b), 1024)], "\x00\t\r\n "), []byte("%PDF")) {
 		return nil, fmt.Errorf("%s is not a PDF", path)
 	}
 	return b, nil
+}
+
+// friendly turns library errors into something a person (or an AI) can act on.
+func friendly(err error) error {
+	if err == nil {
+		return nil
+	}
+	m := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(m, "password") || strings.Contains(m, "encrypt"):
+		if pdfPassword == "" {
+			return fmt.Errorf("this PDF is locked: add --password (or set SIGNET_PDF_PASSWORD)")
+		}
+		return fmt.Errorf("that password does not open this PDF")
+	}
+	return err
+}
+
+// safely runs f and turns a crash inside a PDF library into an error, so one
+// damaged or unusual file can never take Signet down.
+func safely[T any](what string, f func() (T, error)) (out T, err error) {
+	defer func() {
+		if v := recover(); v != nil {
+			err = fmt.Errorf("could not %s: the PDF looks damaged or unusual (%v)", what, v)
+		}
+	}()
+	out, err = f()
+	return out, friendly(err)
 }
 
 // ---------- reading ----------
@@ -204,7 +245,12 @@ func pageLines(path string) ([][]Line, []types.Dim, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	r, err := lpdf.NewReader(bytes.NewReader(b), int64(len(b)))
+	var r *lpdf.Reader
+	if pdfPassword != "" {
+		r, err = lpdf.NewReaderEncrypted(bytes.NewReader(b), int64(len(b)), func() string { return pdfPassword })
+	} else {
+		r, err = lpdf.NewReader(bytes.NewReader(b), int64(len(b)))
+	}
 	if err != nil {
 		return nil, dims, nil // unreadable text layer: fields and placing still work
 	}
@@ -294,6 +340,10 @@ type Hit struct {
 }
 
 func find(path, needle string) ([]Hit, error) {
+	return safely("search the PDF", func() ([]Hit, error) { return findUnsafe(path, needle) })
+}
+
+func findUnsafe(path, needle string) ([]Hit, error) {
 	pages, _, err := pageLines(path)
 	if err != nil {
 		return nil, err
@@ -314,6 +364,10 @@ func find(path, needle string) ([]Hit, error) {
 }
 
 func inspect(path string, maxPages int) (string, error) {
+	return safely("read the PDF", func() (string, error) { return inspectUnsafe(path, maxPages) })
+}
+
+func inspectUnsafe(path string, maxPages int) (string, error) {
 	b, err := readPDF(path)
 	if err != nil {
 		return "", err
@@ -391,13 +445,27 @@ type Result struct {
 }
 
 func apply(path string, plan Plan, out, dir string, rnd *rand.Rand) (Result, error) {
+	return safely("change the PDF", func() (Result, error) { return applyUnsafe(path, plan, out, dir, rnd) })
+}
+
+func applyUnsafe(path string, plan Plan, out, dir string, rnd *rand.Rand) (Result, error) {
 	var res Result
 	b, err := readPDF(path)
 	if err != nil {
 		return res, err
 	}
-	n, err := api.PageCount(bg, bytes.NewReader(b), conf())
+	if out == "" {
+		out = strings.TrimSuffix(path, filepath.Ext(path)) + "-signed.pdf"
+	}
+	if same(path, out) {
+		return res, fmt.Errorf("refusing to overwrite the original: choose another --out")
+	}
+	dims, err := api.PageDims(bg, bytes.NewReader(b), conf())
 	if err != nil {
+		return res, err
+	}
+	n := len(dims)
+	if err := checkItems(plan.Items, dims); err != nil {
 		return res, err
 	}
 	jit := func(a float64) float64 { return (rnd.Float64()*2 - 1) * a }
@@ -505,6 +573,10 @@ func apply(path string, plan Plan, out, dir string, rnd *rand.Rand) (Result, err
 					return res, err
 				}
 			}
+			text = strings.ReplaceAll(text, "\r", "")
+			if bad := undrawable(text); bad != "" {
+				return res, fmt.Errorf("the built-in font can't draw %q in %q; use plain Latin letters there", bad, text)
+			}
 			size := it.Size
 			if size == 0 {
 				size = 11
@@ -589,10 +661,14 @@ func apply(path string, plan Plan, out, dir string, rnd *rand.Rand) (Result, err
 		}
 		b = outBuf.Bytes()
 	}
-	if out == "" {
-		out = strings.TrimSuffix(path, filepath.Ext(path)) + "-signed.pdf"
+	if err := api.Validate(bg, bytes.NewReader(b), conf(), nil); err != nil { // never write a broken PDF
+		return res, fmt.Errorf("the result did not check out as a valid PDF, nothing was written: %w", err)
 	}
-	if err := os.WriteFile(out, b, 0o644); err != nil {
+	mode := os.FileMode(0o644)
+	if info, err := os.Stat(path); err == nil {
+		mode = info.Mode().Perm()
+	}
+	if err := writeAtomic(out, b, mode); err != nil {
 		return res, err
 	}
 	res.Saved = out
@@ -684,4 +760,53 @@ func tint(dataURL, ink string) ([]byte, int, int, error) {
 		return nil, 0, 0, err
 	}
 	return buf.Bytes(), r.Dx(), r.Dy(), nil
+}
+
+// same reports whether a and b are the same file (or would be).
+func same(a, b string) bool {
+	aa, err1 := filepath.Abs(a)
+	bb, err2 := filepath.Abs(b)
+	if err1 == nil && err2 == nil && aa == bb {
+		return true
+	}
+	ia, err1 := os.Stat(a)
+	ib, err2 := os.Stat(b)
+	return err1 == nil && err2 == nil && os.SameFile(ia, ib)
+}
+
+// checkItems catches the usual mistakes before anything is drawn: a position
+// off the page, a silly size.
+func checkItems(items []Item, dims []types.Dim) error {
+	for i, it := range items {
+		pages, err := targetPages(it.Page, len(dims))
+		if err != nil {
+			return fmt.Errorf("item %d: %w", i+1, err)
+		}
+		for _, p := range pages {
+			d := dims[p-1]
+			if it.X < 0 || it.Y < 0 || it.X >= d.Width || it.Y >= d.Height {
+				return fmt.Errorf("item %d (%s): x %g, y %g is off page %d, which is %.0f x %.0f points", i+1, it.Type, it.X, it.Y, p, d.Width, d.Height)
+			}
+		}
+		if it.Size < 0 || it.Size > 200 {
+			return fmt.Errorf("item %d: size %g should be between 1 and 200 points", i+1, it.Size)
+		}
+		if it.Width < 0 || it.Width > 2000 {
+			return fmt.Errorf("item %d: width %g should be between 1 and 2000 points", i+1, it.Width)
+		}
+	}
+	return nil
+}
+
+// undrawable returns the characters the built-in Helvetica (WinAnsi) can't draw.
+func undrawable(s string) string {
+	const extra = "€‚ƒ„…†‡ˆ‰Š‹ŒŽ‘’“”•–—˜™š›œžŸ"
+	var bad []rune
+	for _, r := range s {
+		ok := r == '\n' || (r >= 0x20 && r <= 0x7e) || (r >= 0xa0 && r <= 0xff) || strings.ContainsRune(extra, r)
+		if !ok && !strings.ContainsRune(string(bad), r) {
+			bad = append(bad, r)
+		}
+	}
+	return string(bad)
 }

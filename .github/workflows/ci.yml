@@ -1,10 +1,13 @@
-# Every push and pull request: format, vet, test, and build for every platform.
+# Every push and pull request: format, vet, test (with the race detector),
+# a short fuzz of the PDF reader, a vulnerability scan, and a build for every platform.
 name: ci
 
 on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    - cron: "17 4 * * 1" # weekly, to catch newly published vulnerabilities
 
 permissions:
   contents: read
@@ -24,7 +27,26 @@ jobs:
         if: runner.os == 'Linux'
         run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
       - run: go vet ./...
-      - run: go test ./...
+      - run: go test -race ./...
+
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: damaged PDFs must never crash Signet
+        run: go test -run='^$' -fuzz=FuzzInspect -fuzztime=60s .
+
+  vulnerabilities:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
 
   build:
     runs-on: ubuntu-latest
@@ -36,5 +58,5 @@ jobs:
       - name: build every platform
         run: |
           for t in darwin/arm64 darwin/amd64 linux/amd64 linux/arm64 windows/amd64; do
-            GOOS=${t%/*} GOARCH=${t#*/} CGO_ENABLED=0 go build -ldflags "-s -w" -o /dev/null . || exit 1
+            GOOS=${t%/*} GOARCH=${t#*/} CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /dev/null . || exit 1
           done

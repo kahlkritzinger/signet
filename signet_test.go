@@ -10,10 +10,12 @@ import (
 	"math/rand/v2"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/pdfcpu/pdfcpu/pkg/api"
 )
@@ -153,85 +155,330 @@ func TestApplyDefaultsAndErrors(t *testing.T) {
 	}
 }
 
-func TestServer(t *testing.T) {
-	dir := t.TempDir()
-	h := newServer(dir)
-	do := func(method, target, host, origin string, body []byte) *httptest.ResponseRecorder {
-		r := httptest.NewRequest(method, target, bytes.NewReader(body))
-		r.Host = host
-		if origin != "" {
-			r.Header.Set("Origin", origin)
+type client struct {
+	t      *testing.T
+	h      http.Handler
+	secret string
+	cookie *http.Cookie
+}
+
+const local = "127.0.0.1:7766"
+
+func newClient(t *testing.T, dir string) *client {
+	h, err := newServer(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secret, _ := os.ReadFile(filepath.Join(dir, "secret"))
+	return &client{t: t, h: h, secret: string(secret)}
+}
+
+// do sends a request; auth is "cli" (the secret), "window" (session cookie) or "" (nothing).
+func (c *client) do(method, target, auth string, body []byte, hdr ...string) *httptest.ResponseRecorder {
+	r := httptest.NewRequest(method, target, bytes.NewReader(body))
+	r.Host = local
+	switch auth {
+	case "cli":
+		r.Header.Set("Authorization", "Bearer "+c.secret)
+	case "window":
+		if c.cookie != nil {
+			r.AddCookie(c.cookie)
 		}
-		w := httptest.NewRecorder()
-		h.ServeHTTP(w, r)
-		return w
 	}
-	const local = "127.0.0.1:7766"
-	if w := do("GET", "/", local, "", nil); w.Code != 200 || !strings.Contains(w.Body.String(), "<title>Signet</title>") {
-		t.Errorf("page: %d", w.Code)
+	for i := 0; i+1 < len(hdr); i += 2 {
+		if hdr[i] == "Host" {
+			r.Host = hdr[i+1]
+		} else {
+			r.Header.Set(hdr[i], hdr[i+1])
+		}
 	}
-	if w := do("GET", "/api/store/bank", "evil.example:7766", "", nil); w.Code != 403 {
+	w := httptest.NewRecorder()
+	c.h.ServeHTTP(w, r)
+	return w
+}
+
+func TestOnlyYouCanReachYourData(t *testing.T) {
+	dir := t.TempDir()
+	c := newClient(t, dir)
+	if info, _ := os.Stat(filepath.Join(dir, "secret")); info == nil || (info.Mode().Perm()&0o077 != 0 && os.PathSeparator == '/') {
+		t.Fatalf("secret missing or readable by others: %v", info)
+	}
+	if w := c.do("GET", "/", "", nil); w.Code != 200 || !strings.Contains(w.Body.String(), "<title>Signet</title>") {
+		t.Errorf("the page itself (no data in it) should load: %d", w.Code)
+	}
+	for _, h := range []string{"Content-Security-Policy", "X-Frame-Options", "X-Content-Type-Options", "Referrer-Policy"} {
+		if c.do("GET", "/", "", nil).Header().Get(h) == "" {
+			t.Errorf("missing header %s", h)
+		}
+	}
+	// nobody without the secret or a session: other accounts on this computer
+	for _, path := range []string{"/api/store/bank", "/api/store/profile", "/api/doc/abcdefghijklmnopqrst"} {
+		if w := c.do("GET", path, "", nil); w.Code != 401 {
+			t.Errorf("%s without auth: %d", path, w.Code)
+		}
+	}
+	if w := c.do("POST", "/api/launch", "", nil); w.Code != 401 {
+		t.Errorf("launch without the secret: %d", w.Code)
+	}
+	if w := c.do("GET", "/api/store/bank", "", nil, "Authorization", "Bearer wrong"); w.Code != 401 {
+		t.Errorf("wrong secret: %d", w.Code)
+	}
+	// websites: DNS rebinding, cross-site requests, foreign origins
+	if w := c.do("GET", "/api/store/bank", "cli", nil, "Host", "evil.example:7766"); w.Code != 403 {
 		t.Errorf("DNS rebinding not blocked: %d", w.Code)
 	}
-	if w := do("PUT", "/api/store/bank", local, "https://evil.example", []byte("[]")); w.Code != 403 {
+	if w := c.do("GET", "/api/store/bank", "cli", nil, "Sec-Fetch-Site", "cross-site"); w.Code != 403 {
+		t.Errorf("cross-site fetch not blocked: %d", w.Code)
+	}
+	if w := c.do("PUT", "/api/store/bank", "cli", []byte("[]"), "Origin", "https://evil.example"); w.Code != 403 {
 		t.Errorf("foreign origin not blocked: %d", w.Code)
 	}
-	if w := do("GET", "/api/store/bank", local, "", nil); w.Body.String() != "null" {
-		t.Errorf("empty bank: %q", w.Body.String())
+	// the CLI, with the secret
+	if w := c.do("GET", "/api/store/bank", "cli", nil); w.Code != 200 || w.Body.String() != "null" {
+		t.Errorf("CLI read: %d %q", w.Code, w.Body.String())
 	}
-	if w := do("PUT", "/api/store/bank", local, "http://"+local, []byte(`[{"id":"a"}]`)); w.Code != 200 {
-		t.Errorf("save bank: %d", w.Code)
-	}
-	if w := do("GET", "/api/store/bank", local, "", nil); w.Body.String() != `[{"id":"a"}]` {
-		t.Errorf("bank round trip: %q", w.Body.String())
-	}
-	if w := do("PUT", "/api/store/profile", local, "", []byte("not json")); w.Code != 400 {
-		t.Errorf("bad json: %d", w.Code)
-	}
-	if w := do("GET", "/api/store/secrets", local, "", nil); w.Code != 404 {
-		t.Errorf("unknown key: %d", w.Code)
-	}
+}
 
+func TestWindowsGetInWithAOneTimeCode(t *testing.T) {
+	c := newClient(t, t.TempDir())
+	var launch struct{ Code string }
+	json.Unmarshal(c.do("POST", "/api/launch", "cli", nil).Body.Bytes(), &launch)
+	w := c.do("GET", "/?k="+launch.Code+"&doc=abc", "", nil)
+	if w.Code != 303 || w.Header().Get("Location") != "/?doc=abc" {
+		t.Fatalf("redeem: %d %q", w.Code, w.Header().Get("Location"))
+	}
+	cookies := w.Result().Cookies()
+	if len(cookies) != 1 || !cookies[0].HttpOnly || cookies[0].SameSite != http.SameSiteStrictMode {
+		t.Fatalf("session cookie: %+v", cookies)
+	}
+	c.cookie = cookies[0]
+	if w := c.do("GET", "/api/store/bank", "window", nil); w.Code != 200 {
+		t.Errorf("window with session: %d", w.Code)
+	}
+	if w := c.do("GET", "/?k="+launch.Code, "", nil); len(w.Result().Cookies()) != 0 {
+		t.Error("a launch code worked twice")
+	}
+	if w := c.do("GET", "/?k=madeup", "", nil); len(w.Result().Cookies()) != 0 {
+		t.Error("a made-up code gave a session")
+	}
+	// a window may not choose where files are written: only the CLI can
+	pdf, _ := os.ReadFile(sample)
+	var up struct{ ID string }
+	json.Unmarshal(c.do("POST", "/api/docs?path=/etc/passwd", "window", pdf).Body.Bytes(), &up)
+	if w := c.do("POST", "/api/save/"+up.ID, "window", pdf); w.Code != 404 {
+		t.Errorf("a window chose where to save: %d", w.Code)
+	}
+}
+
+func TestDocumentsAndSaving(t *testing.T) {
+	c := newClient(t, t.TempDir())
 	pdf, _ := os.ReadFile(sample)
 	orig := filepath.Join(t.TempDir(), "Lease.pdf")
-	os.WriteFile(orig, pdf, 0o644)
+	os.WriteFile(orig, pdf, 0o600)
 	up := func(path string) string {
-		w := do("POST", "/api/docs?name=Lease.pdf&path="+path, local, "", pdf)
+		w := c.do("POST", "/api/docs?name=Lease.pdf&path="+url.QueryEscape(path), "cli", pdf)
 		var r struct{ ID string }
 		json.Unmarshal(w.Body.Bytes(), &r)
 		return r.ID
 	}
-	id := up(orig)
-	if w := do("GET", "/api/doc/"+id, local, "", nil); w.Code != 200 || w.Header().Get("X-Name") != "Lease.pdf" {
-		t.Errorf("get doc: %d %q", w.Code, w.Header().Get("X-Name"))
-	}
-	if w := do("POST", "/api/docs", local, "", []byte("hello")); w.Code != 400 {
-		t.Errorf("non-PDF accepted: %d", w.Code)
-	}
 	save := func(id string, body []byte) (int, string) {
-		w := do("POST", "/api/save/"+id, local, "", body)
+		w := c.do("POST", "/api/save/"+id, "cli", body)
 		var r struct{ Path string }
 		json.Unmarshal(w.Body.Bytes(), &r)
 		return w.Code, r.Path
+	}
+	id := up(orig)
+	if w := c.do("GET", "/api/doc/"+id, "cli", nil); w.Code != 200 || w.Header().Get("X-Name") != "Lease.pdf" {
+		t.Errorf("get doc: %d %q", w.Code, w.Header().Get("X-Name"))
+	}
+	if w := c.do("POST", "/api/docs", "cli", []byte("hello")); w.Code != 400 {
+		t.Errorf("non-PDF accepted: %d", w.Code)
 	}
 	_, first := save(id, pdf)
 	if first != filepath.Join(filepath.Dir(orig), "Lease-signed.pdf") {
 		t.Errorf("first save went to %q", first)
 	}
+	if info, _ := os.Stat(first); info == nil || (os.PathSeparator == '/' && info.Mode().Perm() != 0o600) {
+		t.Errorf("signed copy should be as private as the original: %v", info)
+	}
 	if _, again := save(id, pdf); again != first {
 		t.Errorf("saving again should overwrite our own file, went to %q", again)
 	}
 	if _, other := save(up(orig), pdf); !strings.HasSuffix(other, "Lease-signed-2.pdf") {
-		t.Errorf("a second document must not overwrite the first's file: %q", other)
+		t.Errorf("a second document must not overwrite the first one's file: %q", other)
 	}
 	if code, _ := save(id, []byte("nope")); code != 400 {
 		t.Errorf("non-PDF saved: %d", code)
 	}
-	if code, _ := save(up(""), pdf); code != 404 {
-		t.Errorf("doc without original saved: %d", code)
-	}
 	if code, _ := save("abc", pdf); code != 404 {
 		t.Errorf("bad id: %d", code)
 	}
-	_ = http.StatusOK
+	if b, _ := os.ReadFile(orig); !bytes.Equal(b, pdf) {
+		t.Error("the original changed")
+	}
+}
+
+func TestStoreKeepsBackupsAndHealsItself(t *testing.T) {
+	dir := t.TempDir()
+	c := newClient(t, dir)
+	for i := 0; i < 14; i++ {
+		body := []byte(`[{"id":"m` + itoa(i) + `","kind":"sig","mask":"data:,x","ar":1}]`)
+		if w := c.do("PUT", "/api/store/bank", "cli", body); w.Code != 200 {
+			t.Fatalf("save %d: %d", i, w.Code)
+		}
+	}
+	if n := len(backups(dir, "bank")); n != keepBackups {
+		t.Errorf("%d backups, want %d", n, keepBackups)
+	}
+	if w := c.do("PUT", "/api/store/bank", "cli", []byte(`{"not":"a list"}`)); w.Code != 400 {
+		t.Errorf("a non-list bank was accepted: %d", w.Code)
+	}
+	os.WriteFile(storePath(dir, "bank"), []byte(`[{"id":"m13", "kind":`), 0o600) // damaged, e.g. a full disk
+	w := c.do("GET", "/api/store/bank", "cli", nil)
+	if w.Code != 200 || !strings.Contains(w.Body.String(), `"m12"`) {
+		t.Errorf("not restored from the newest backup: %d %s", w.Code, w.Body.String())
+	}
+	if b, _ := os.ReadFile(storePath(dir, "bank")); !json.Valid(b) {
+		t.Error("damaged file not replaced")
+	}
+	damaged, _ := filepath.Glob(storePath(dir, "bank") + ".damaged-*")
+	if len(damaged) != 1 {
+		t.Errorf("the damaged file should be kept aside: %v", damaged)
+	}
+	leftovers, _ := filepath.Glob(filepath.Join(dir, ".*.tmp"))
+	if len(leftovers) != 0 {
+		t.Errorf("temp files left behind: %v", leftovers)
+	}
+}
+
+func TestTheCLIOnlyTrustsTheRealEditor(t *testing.T) {
+	dir := t.TempDir()
+	secret, _ := loadSecret(dir)
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"ok":true,"app":"signet","proof":"0000"}`)) // something else squatting the port
+	}))
+	defer fake.Close()
+	if verified(fake.URL, secret) {
+		t.Fatal("trusted a fake editor")
+	}
+	h, _ := newServer(dir)
+	real := httptest.NewServer(h)
+	defer real.Close()
+	if !verified(strings.Replace(real.URL, "127.0.0.1", "localhost", 1), secret) && !verified(real.URL, secret) {
+		t.Fatal("did not trust the real editor")
+	}
+	other, _ := loadSecret(t.TempDir()) // another account's Signet
+	if verified(real.URL, other) {
+		t.Fatal("trusted another account's editor")
+	}
+}
+
+func TestServeFindsAFreePortAndRecordsIt(t *testing.T) {
+	dir := t.TempDir()
+	busy := httptest.NewServer(http.NotFoundHandler()) // the preferred port is taken
+	defer busy.Close()
+	_, port, _ := strings.Cut(strings.TrimPrefix(busy.URL, "http://"), ":")
+	t.Setenv("SIGNET_PORT", port)
+	logf, _ := os.CreateTemp(t.TempDir(), "log")
+	go serve(dir, logf)
+	secret, _ := loadSecret(dir) // racing serve to create it: both must end up with the same one
+	var base string
+	for i := 0; i < 100 && base == ""; i++ {
+		base, _ = findEditor(dir, secret)
+		time.Sleep(20 * time.Millisecond)
+	}
+	if base == "" || strings.HasSuffix(base, ":"+port) {
+		t.Fatalf("editor not found on a free port: %q", base)
+	}
+}
+
+func TestCLIGuardsAgainstMistakes(t *testing.T) {
+	dir := testData(t)
+	r := rand.New(rand.NewPCG(1, 2))
+	tmp := t.TempDir()
+	cases := map[string]string{
+		`{"items":[{"type":"sign","page":1,"x":700,"y":10}]}`:            "off page 1",
+		`{"items":[{"type":"text","page":1,"x":10,"y":-5,"text":"a"}]}`:  "off page 1",
+		`{"items":[{"type":"text","page":1,"x":10,"y":10,"text":"日本"}]}`: "can't draw",
+		`{"items":[{"type":"text","page":1,"x":10,"y":10,"size":900}]}`:  "between 1 and 200",
+	}
+	for js, want := range cases {
+		var p Plan
+		must(json.Unmarshal([]byte(js), &p))
+		if _, err := apply(sample, p, filepath.Join(tmp, "x.pdf"), dir, r); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%s: got %v, want %q", js, err, want)
+		}
+	}
+	src := filepath.Join(tmp, "Mine.pdf")
+	b, _ := os.ReadFile(sample)
+	os.WriteFile(src, b, 0o644)
+	if _, err := apply(src, Plan{}, src, dir, r); err == nil || !strings.Contains(err.Error(), "overwrite the original") {
+		t.Errorf("overwrote the original: %v", err)
+	}
+	var p Plan
+	must(json.Unmarshal([]byte(`{"items":[{"type":"text","page":1,"x":72,"y":300,"text":"Paid 100%p in full, café, naïve – ok"}]}`), &p))
+	if _, err := apply(sample, p, filepath.Join(tmp, "ok.pdf"), dir, r); err != nil {
+		t.Errorf("Latin text with accents should work: %v", err)
+	}
+}
+
+func TestLockedPDFs(t *testing.T) {
+	locked := filepath.Join(t.TempDir(), "locked.pdf")
+	c := conf()
+	c.UserPW, c.OwnerPW = "s3cret", "s3cret"
+	if err := api.EncryptFile(bg, sample, locked, c); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { pdfPassword = "" }()
+	if _, err := inspect(locked, 1); err == nil || !strings.Contains(err.Error(), "--password") {
+		t.Errorf("locked without password: %v", err)
+	}
+	pdfPassword = "wrong"
+	if _, err := inspect(locked, 1); err == nil || !strings.Contains(err.Error(), "password does not open") {
+		t.Errorf("wrong password: %v", err)
+	}
+	pdfPassword = "s3cret"
+	if md, err := inspect(locked, 1); err != nil || !strings.Contains(md, "tenant.name") {
+		t.Errorf("right password: %v", err)
+	}
+}
+
+// Damaged and hostile PDFs must give an error, never a crash.
+func TestBrokenPDFsNeverCrash(t *testing.T) {
+	good, _ := os.ReadFile(sample)
+	dir := testData(t)
+	tmp := t.TempDir()
+	r := rand.New(rand.NewPCG(3, 4))
+	variants := [][]byte{
+		[]byte("%PDF-1.7\n"), good[:len(good)/2], good[:len(good)-30],
+		append(append([]byte{}, good[:200]...), bytes.Repeat([]byte("x"), 500)...),
+	}
+	for i := 0; i < 40; i++ { // random corruption
+		b := append([]byte{}, good...)
+		for j := 0; j < 1+r.IntN(20); j++ {
+			b[9+r.IntN(len(b)-9)] = byte(r.IntN(256))
+		}
+		variants = append(variants, b)
+	}
+	var plan Plan
+	must(json.Unmarshal([]byte(`{"fields":{"tenant.name":"x"},"items":[{"type":"sign","page":1,"x":100,"y":100}]}`), &plan))
+	for i, v := range variants {
+		f := filepath.Join(tmp, "b"+itoa(i)+".pdf")
+		os.WriteFile(f, v, 0o644)
+		inspect(f, 3)
+		find(f, "Signature")
+		apply(f, plan, filepath.Join(tmp, "o"+itoa(i)+".pdf"), dir, r)
+	}
+}
+
+func FuzzInspect(f *testing.F) {
+	good, _ := os.ReadFile(sample)
+	f.Add(good)
+	f.Add([]byte("%PDF-1.4\n1 0 obj<<>>endobj\ntrailer<<>>\n%%EOF"))
+	f.Fuzz(func(t *testing.T, b []byte) {
+		p := filepath.Join(t.TempDir(), "f.pdf")
+		os.WriteFile(p, b, 0o644)
+		inspect(p, 2)
+		find(p, "a")
+	})
 }
