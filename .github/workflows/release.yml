@@ -33,7 +33,7 @@ jobs:
               -ldflags "-s -w -X main.version=${GITHUB_REF_NAME}" -o "dist/signet-$os-$arch$ext" .
           done
           cd dist && sha256sum signet-* > checksums.txt
-      - uses: actions/attest-build-provenance@v2
+      - uses: actions/attest-build-provenance@v4
         with:
           subject-path: "dist/signet-*"
       - name: publish
@@ -68,7 +68,7 @@ jobs:
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.description=Signet: fill, sign and initial PDFs
             org.opencontainers.image.licenses=MIT
-      - uses: actions/attest-build-provenance@v2
+      - uses: actions/attest-build-provenance@v4
         with:
           subject-name: ghcr.io/${{ github.repository }}
           subject-digest: ${{ steps.push.outputs.digest }}
