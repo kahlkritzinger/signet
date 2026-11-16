@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -57,7 +58,7 @@ func TestOneAccountAcrossMachines(t *testing.T) {
 	if err := connectAccount(mac, ts.URL, "mac.access", "s3cret"); err != nil {
 		t.Fatal(err)
 	}
-	if st, _ := os.Stat(accountPath(mac)); st.Mode().Perm() != 0o600 {
+	if st, _ := os.Stat(accountPath(mac)); runtime.GOOS != "windows" && st.Mode().Perm() != 0o600 {
 		t.Errorf("account file is %v", st.Mode().Perm())
 	}
 
