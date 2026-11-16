@@ -119,6 +119,25 @@ services:
 
 The image is tiny (just the binary, not root), logs one JSON object per line, and has a health check. On the server, the CLI uses the same data: `docker compose exec signet /signet profile`, or run the binary with `SIGNET_DATA` pointing at `./data`. In this mode Signet's only outgoing connection is fetching Access's public signing keys.
 
+### One account on all your machines
+
+With Signet on a server, your laptop can use the same signatures and profile, so a signature drawn on your phone is on your laptop too. In Cloudflare Zero Trust:
+
+1. Add a second Access application for the path `signet.example.com/api/sync`, with a **Service Auth** policy.
+2. Create a service token for each machine, and allow it in that policy.
+3. On the server, set `SIGNET_ACCESS_SYNC_AUD` (that application's AUD tag) and `SIGNET_ACCESS_SYNC_CLIENT` (the tokens' Client IDs, comma-separated).
+
+Then on each machine:
+
+```sh
+SIGNET_ACCOUNT_ID=... SIGNET_ACCOUNT_SECRET=... signet account connect https://signet.example.com
+signet account        # check it
+```
+
+From then on, the editor and the CLI on that machine read and save your signatures and profile on the server. PDFs stay on the machine. The token is kept in `~/.signet/account.json`, readable only by you.
+
+A copy of your data stays on the machine. Without a connection, Signet reads that copy and won't save until it's back online. If something changed elsewhere since you opened it, a save is refused, never silently overwritten.
+
 ## Not yet
 
 - Scanned PDFs: no text to search, but you can still place everything by hand

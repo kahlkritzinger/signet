@@ -36,6 +36,7 @@ const usage = `Signet: fill, sign and initial PDFs. Your signatures stay on your
   signet profile                     what can be filled in: "Full name", "ID number", ...
   signet bank                        your signatures and initials
   signet apply FILE PLAN.json [--out OUT]   fill, write, sign, initial -> FILE-signed.pdf
+  signet account [connect URL | disconnect]   share one account (signatures, profile) with your Signet server
   signet serve                       run the editor in this terminal (it normally runs in the background)
   signet version
 
@@ -96,6 +97,8 @@ func run(args []string) error {
 		return health()
 	case "set-default":
 		return setDefault()
+	case "account":
+		return accountCmd(dir, args)
 	case "inspect":
 		fs := flag.NewFlagSet("inspect", flag.ContinueOnError)
 		pages := fs.Int("pages", 5, "pages of text to show")

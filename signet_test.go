@@ -41,8 +41,10 @@ func testData(t *testing.T) string {
 	prof := `{"groups":[{"name":"Me","fields":[{"key":"first","label":"First name","value":"Ann"},{"key":"sur","label":"Surname","value":"Smith"},
 	{"key":"id","label":"ID number","value":"800101"},{"key":"street","label":"Street name","value":"Long St","addr":true},
 	{"key":"city","label":"City","value":"Cape Town","addr":true}]},{"name":"Car","fields":[{"label":"Registration","value":"CA 123"}]}]}`
-	must(writeStore(dir, "bank", bank))
-	must(writeStore(dir, "profile", []byte(prof)))
+	_, err := writeLocal(dir, "bank", bank, "")
+	must(err)
+	_, err = writeLocal(dir, "profile", []byte(prof), "")
+	must(err)
 	return dir
 }
 

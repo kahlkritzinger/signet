@@ -12,6 +12,13 @@ package main
 //	SIGNET_ACCESS_EMAIL  who may use it (comma-separated)
 //	SIGNET_HOSTS         the public hostname(s), e.g. signet.example.com
 //
+// To let your other machines share this account (signet account connect), add
+// a second Access application for the path <host>/api/sync with a Service Auth
+// policy, and a service token for each machine:
+//
+//	SIGNET_ACCESS_SYNC_AUD     that application's Audience (AUD) tag
+//	SIGNET_ACCESS_SYNC_CLIENT  the service tokens' Client IDs (comma-separated)
+//
 // Without these, Signet refuses to listen anywhere but 127.0.0.1.
 
 import (
@@ -35,6 +42,8 @@ var certsURL = func(team string) string { return "https://" + team + "/cdn-cgi/a
 type accessAuth struct {
 	team, aud string
 	emails    map[string]bool
+	syncAud   string
+	clients   map[string]bool // service-token Client IDs allowed to sync
 	certsURL  string
 	client    *http.Client
 
@@ -59,48 +68,80 @@ func accessFromEnv() (*accessAuth, error) {
 	if aud == "" || len(emails) == 0 {
 		return nil, fmt.Errorf("SIGNET_ACCESS_TEAM is set, so SIGNET_ACCESS_AUD and SIGNET_ACCESS_EMAIL are needed too")
 	}
-	return &accessAuth{team: team, aud: aud, emails: emails, certsURL: certsURL(team),
-		client: &http.Client{Timeout: 10 * time.Second}}, nil
+	syncAud := strings.TrimSpace(os.Getenv("SIGNET_ACCESS_SYNC_AUD"))
+	clients := map[string]bool{}
+	for _, c := range strings.Split(os.Getenv("SIGNET_ACCESS_SYNC_CLIENT"), ",") {
+		if c = strings.TrimSpace(c); c != "" {
+			clients[c] = true
+		}
+	}
+	if (syncAud == "") != (len(clients) == 0) {
+		return nil, fmt.Errorf("syncing needs both SIGNET_ACCESS_SYNC_AUD and SIGNET_ACCESS_SYNC_CLIENT")
+	}
+	return &accessAuth{team: team, aud: aud, emails: emails, syncAud: syncAud, clients: clients,
+		certsURL: certsURL(team), client: &http.Client{Timeout: 10 * time.Second}}, nil
 }
 
 // email returns the signed-in, allowed email for this request, or "".
 func (a *accessAuth) email(r *http.Request) string {
+	c, ok := a.verify(r, a.aud)
+	if !ok {
+		return ""
+	}
+	if e := strings.ToLower(c.Email); e != "" && a.emails[e] {
+		return e
+	}
+	return ""
+}
+
+// syncClient: the request carries an Access token for the sync application,
+// issued to a service token you allowed.
+func (a *accessAuth) syncClient(r *http.Request) bool {
+	if a.syncAud == "" {
+		return false
+	}
+	c, ok := a.verify(r, a.syncAud)
+	return ok && c.CommonName != "" && a.clients[c.CommonName]
+}
+
+type accessClaims struct {
+	Iss        string          `json:"iss"`
+	Aud        json.RawMessage `json:"aud"`
+	Exp        float64         `json:"exp"`
+	Nbf        float64         `json:"nbf"`
+	Email      string          `json:"email"`
+	CommonName string          `json:"common_name"` // a service token's Client ID
+}
+
+// verify checks the Access token's signature, issuer, audience and dates.
+func (a *accessAuth) verify(r *http.Request, aud string) (accessClaims, bool) {
+	var c accessClaims
 	tok := r.Header.Get("Cf-Access-Jwt-Assertion")
 	parts := strings.Split(tok, ".")
 	if len(parts) != 3 {
-		return ""
+		return c, false
 	}
 	var hdr struct{ Alg, Kid string }
 	if !decodePart(parts[0], &hdr) || hdr.Alg != "RS256" {
-		return ""
+		return c, false
 	}
 	key := a.key(hdr.Kid)
 	sig, err := base64.RawURLEncoding.DecodeString(parts[2])
 	if key == nil || err != nil {
-		return ""
+		return c, false
 	}
 	sum := sha256.Sum256([]byte(parts[0] + "." + parts[1]))
 	if rsa.VerifyPKCS1v15(key, crypto.SHA256, sum[:], sig) != nil {
-		return ""
-	}
-	var c struct {
-		Iss   string          `json:"iss"`
-		Aud   json.RawMessage `json:"aud"`
-		Exp   float64         `json:"exp"`
-		Nbf   float64         `json:"nbf"`
-		Email string          `json:"email"`
+		return c, false
 	}
 	if !decodePart(parts[1], &c) {
-		return ""
+		return c, false
 	}
 	now := float64(time.Now().Unix())
-	if c.Iss != "https://"+a.team || !hasAud(c.Aud, a.aud) || c.Exp == 0 || now > c.Exp+30 || (c.Nbf != 0 && now < c.Nbf-30) {
-		return ""
+	if c.Iss != "https://"+a.team || !hasAud(c.Aud, aud) || c.Exp == 0 || now > c.Exp+30 || (c.Nbf != 0 && now < c.Nbf-30) {
+		return c, false
 	}
-	if e := strings.ToLower(c.Email); a.emails[e] {
-		return e
-	}
-	return ""
+	return c, true
 }
 
 func decodePart(s string, v any) bool {

@@ -17,7 +17,8 @@ package main
 //	POST /api/launch                 a one-time code for opening a window (CLI only)
 //	GET  /?k=CODE&doc=...            swaps the code for a session, then shows the editor
 //	GET  /api/store/{bank|profile}   your signature bank / profile (JSON)
-//	PUT  /api/store/{bank|profile}
+//	PUT  /api/store/{bank|profile}    X-Signet-If-Version: refuse (409) if it changed since
+//	GET|PUT /api/sync/{bank|profile}  the same, for your other machines (see account.go)
 //	POST /api/docs?name=&path=       hand a PDF to the editor -> {"id": ...}
 //	GET  /api/doc/{id}               the PDF (name in X-Name)
 //	POST /api/save/{id}              write <name>-signed.pdf next to the original
@@ -60,6 +61,9 @@ const (
 	codeTTL     = 2 * time.Minute
 	maxSessions = 64
 	cookieName  = "signet"
+
+	versionHeader   = "X-Signet-Version"    // which saved state you got (Cloudflare rewrites ETags, so not those)
+	ifVersionHeader = "X-Signet-If-Version" // only save if it is still this one
 )
 
 var docID = regexp.MustCompile(`^[A-Za-z0-9_-]{16,64}$`)
@@ -110,6 +114,8 @@ func newServer(dir string) (http.Handler, error) {
 	mux.HandleFunc("POST /api/launch", s.cliOnly(s.launch))
 	mux.HandleFunc("GET /api/store/{key}", s.authed(s.storeGet))
 	mux.HandleFunc("PUT /api/store/{key}", s.authed(s.storePut))
+	mux.HandleFunc("GET /api/sync/{key}", s.syncAuthed(s.storeGet)) // your other machines (account.go)
+	mux.HandleFunc("PUT /api/sync/{key}", s.syncAuthed(s.storePut))
 	mux.HandleFunc("POST /api/docs", s.authed(s.docUpload))
 	mux.HandleFunc("GET /api/doc/{id}", s.authed(s.docGet))
 	mux.HandleFunc("POST /api/save/{id}", s.authed(s.docSave))
@@ -246,6 +252,18 @@ func (s *server) authed(h http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// syncAuthed lets in your other machines: the CLI secret, or (behind Cloudflare
+// Access) a service token you allowed in SIGNET_ACCESS_SYNC_CLIENT.
+func (s *server) syncAuthed(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !s.cliOK(r) && !(s.access != nil && s.access.syncClient(r)) {
+			writeJSON(w, 401, map[string]string{"error": "this machine is not allowed to sync"})
+			return
+		}
+		h(w, r)
+	}
+}
+
 func (s *server) cliOnly(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !s.cliOK(r) {
@@ -321,6 +339,7 @@ func (s *server) storeGet(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 500, map[string]string{"error": err.Error()})
 		return
 	}
+	w.Header().Set(versionHeader, storeVersion(b))
 	if b == nil {
 		b = []byte("null")
 	}
@@ -343,10 +362,16 @@ func (s *server) storePut(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]string{"error": err.Error()})
 		return
 	}
-	if err := writeStore(s.dir, key, body); err != nil {
-		writeJSON(w, 500, map[string]string{"error": err.Error()})
+	v, err := writeStore(s.dir, key, body, r.Header.Get(ifVersionHeader))
+	if errors.Is(err, errChanged) {
+		writeJSON(w, 409, map[string]string{"error": err.Error()})
 		return
 	}
+	if err != nil {
+		writeJSON(w, 502, map[string]string{"error": err.Error()})
+		return
+	}
+	w.Header().Set(versionHeader, v)
 	writeJSON(w, 200, true)
 }
 

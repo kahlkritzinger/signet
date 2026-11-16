@@ -36,7 +36,17 @@ const store = {
   set(k, v) {
     const s = JSON.stringify(v);
     try { localStorage.setItem('signet.' + k, s); } catch (e) { if (!this.server) alert('Could not save to this browser: ' + e.message); }
-    if (this.server && (k === 'bank' || k === 'profile')) fetch('api/store/' + k, { method: 'PUT', body: s }).catch(() => {});
+    if (this.server && (k === 'bank' || k === 'profile')) this.q[k] = (this.q[k] || Promise.resolve()).then(() => this.put(k, s));
+  },
+  tags: {}, q: {},   // the saved version each change is made on, so a change made elsewhere is never overwritten
+  async put(k, s) {
+    try {
+      const headers = this.tags[k] ? { 'X-Signet-If-Version': this.tags[k] } : {};
+      const r = await fetch('api/store/' + k, { method: 'PUT', body: s, headers });
+      if (r.ok) { this.tags[k] = r.headers.get('X-Signet-Version') || ''; return; }
+      const e = await r.json().catch(() => ({}));
+      alert('Not saved: ' + (e.error || 'error ' + r.status));
+    } catch (e) { alert('Not saved: Signet could not be reached (' + e.message + ')'); }
   },
   async init() {
     for (const k of ['bank', 'profile']) {
@@ -44,6 +54,7 @@ const store = {
         const r = await fetch('api/store/' + k);
         if (!r.ok || !(r.headers.get('content-type') || '').includes('json')) return;
         this.server = true;
+        this.tags[k] = r.headers.get('X-Signet-Version') || '';
         const v = await r.json(), local = this.get(k, null);
         if (v !== null) localStorage.setItem('signet.' + k, JSON.stringify(v));
         else if (local) this.set(k, local);

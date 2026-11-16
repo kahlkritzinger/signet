@@ -8,6 +8,8 @@ package main
 // damaged, the newest good backup is used instead and put back.
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -65,8 +67,42 @@ func dataDir() string {
 func storePath(dir, key string) string { return filepath.Join(dir, key+".json") }
 
 // readStore returns the raw JSON for key, or nil if it has never been saved.
-// A damaged file is replaced by its newest good backup.
+// With an account connected (see account.go) it comes from your Signet server.
 func readStore(dir, key string) ([]byte, error) {
+	if acc, err := loadAccount(dir); err != nil {
+		return nil, err
+	} else if acc != nil {
+		return acc.read(dir, key)
+	}
+	return readLocal(dir, key)
+}
+
+// writeStore saves key. ifVersion, when set, is the version the change was
+// made on: if the data changed since (another window, your phone), nothing is
+// written and errChanged comes back. It returns the new version.
+func writeStore(dir, key string, body []byte, ifVersion string) (string, error) {
+	if acc, err := loadAccount(dir); err != nil {
+		return "", err
+	} else if acc != nil {
+		return acc.write(dir, key, body, ifVersion)
+	}
+	return writeLocal(dir, key, body, ifVersion)
+}
+
+var errChanged = errors.New("your signatures or profile were changed somewhere else (another window or device): reload to get the latest, then make your change again")
+
+// storeVersion names a saved state of a store file; "" when nothing is saved.
+func storeVersion(b []byte) string {
+	if b == nil {
+		return ""
+	}
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:12])
+}
+
+// readLocal reads key from this machine. A damaged file is replaced by its
+// newest good backup.
+func readLocal(dir, key string) ([]byte, error) {
 	b, err := os.ReadFile(storePath(dir, key))
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
@@ -92,20 +128,30 @@ func readStore(dir, key string) ([]byte, error) {
 	return good, nil
 }
 
-func writeStore(dir, key string, body []byte) error {
+func writeLocal(dir, key string, body []byte, ifVersion string) (string, error) {
 	if !json.Valid(body) {
-		return fmt.Errorf("not json")
+		return "", fmt.Errorf("not json")
 	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
+		return "", err
 	}
 	storeMu.Lock()
 	defer storeMu.Unlock()
 	path := storePath(dir, key)
-	if old, err := os.ReadFile(path); err == nil && json.Valid(old) && string(old) != string(body) {
+	old, err := os.ReadFile(path)
+	if err != nil {
+		old = nil
+	}
+	if ifVersion != "" && ifVersion != storeVersion(old) && string(old) != string(body) {
+		return "", errChanged
+	}
+	if old != nil && json.Valid(old) && string(old) != string(body) {
 		backup(dir, key, old)
 	}
-	return writeAtomic(path, body, 0o600)
+	if err := writeAtomic(path, body, 0o600); err != nil {
+		return "", err
+	}
+	return storeVersion(body), nil
 }
 
 func backupDir(dir string) string { return filepath.Join(dir, "backups") }
